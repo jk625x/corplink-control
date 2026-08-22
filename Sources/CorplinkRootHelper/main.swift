@@ -360,9 +360,6 @@ private func startJob(_ job: ManagedJob, uid: uid_t) -> String? {
     removePendingRestore(job.id)
     return nil
   }
-  if job.launchOnlyOnce, readSnapshot()?.pendingJobIDs.contains(job.id) == true {
-    return "\(job.name)：LaunchOnlyOnce 任务停止后必须重启 Mac 才能可靠恢复"
-  }
   if isDisabled(job, uid: uid) { return "\(job.name)：已被系统或组织策略禁用，未擅自修改" }
   guard restoreSavedPlistIfNeeded(job, path: path, uid: uid) else {
     return "\(job.name)：找不到 plist，且没有可用的停止前备份"
@@ -412,7 +409,7 @@ private func stopComponent(id: String) -> Int32 {
     fputs("\(error)\n", stderr)
     return 1
   }
-  let suffix = job.launchOnlyOnce ? "；再次启动需要重启 Mac" : ""
+  let suffix = job.launchOnlyOnce ? "；再次启动时将使用原始 plist 重新注册" : ""
   print("\(job.name)已停止，无任务或进程残留\(suffix)。")
   return 0
 }
@@ -478,8 +475,35 @@ private func stopSuite() -> Int32 {
     fputs(errors.joined(separator: "\n") + "\n", stderr)
     return 1
   }
-  let rebootNote = pendingIDs.contains("network-monitor") ? "；网络监控恢复需要重启 Mac" : ""
-  print("整套飞连运行组件已停止；持续观察 5 秒未复活，无已知任务或进程残留\(rebootNote)。")
+  let monitorNote =
+    pendingIDs.contains("network-monitor") ? "；再次开始时会重新注册网络监控" : ""
+  print("整套飞连运行组件已停止；持续观察 5 秒未复活，无已知任务或进程残留\(monitorNote)。")
+  return 0
+}
+
+private func startSuite() -> Int32 {
+  guard requireRoot("启动整套飞连") else { return 77 }
+  let uid = consoleUID()
+  let startOrder = [
+    "protection", "network-monitor", "connection", "mdm", "data-forwarder",
+    "network-agent", "app-blocker", "client",
+  ]
+  var errors: [String] = []
+  var skipped: [String] = []
+  for id in startOrder {
+    guard let job = jobs.first(where: { $0.id == id }) else { continue }
+    if isDisabled(job, uid: uid) {
+      skipped.append("\(job.name)（策略禁用）")
+      continue
+    }
+    if let error = startJob(job, uid: uid) { errors.append(error) }
+  }
+  guard errors.isEmpty else {
+    fputs(errors.joined(separator: "\n") + "\n", stderr)
+    return 1
+  }
+  let skippedNote = skipped.isEmpty ? "" : "；未启动：\(skipped.joined(separator: "、"))"
+  print("所有已安装且未被策略禁用的飞连组件均已启动并通过验证\(skippedNote)。")
   return 0
 }
 
@@ -501,7 +525,7 @@ private func restoreSuite() -> Int32 {
   }
   guard errors.isEmpty else {
     fputs(errors.joined(separator: "\n") + "\n", stderr)
-    return errors.contains(where: { $0.contains("LaunchOnlyOnce") }) ? 4 : 1
+    return 1
   }
   print("已经恢复停止前运行的飞连组件，并逐项通过启动验证。")
   return 0
@@ -560,6 +584,7 @@ private func printHelp() {
 
     整套控制：
       stop-suite                     保存运行快照并停止全部已知运行组件
+      start-suite                    启动全部已安装且未被策略禁用的组件
       restore-suite                  恢复 stop-suite 前运行的组件
 
     单项控制：
@@ -572,7 +597,7 @@ private func printHelp() {
     组件 id：
       \(jobs.map { "\($0.id) (\($0.name))" }.joined(separator: ", "))
 
-    注意：network-monitor 使用 LaunchOnlyOnce，停止后必须重启 Mac 才能可靠恢复。
+    注意：network-monitor 使用 LaunchOnlyOnce；重新启动时会用原始 plist 创建新的 launchd 任务实例。
     """)
 }
 
@@ -590,6 +615,7 @@ case "status": exit(printStatus())
 case "start": exit(startComponent(id: "connection"))
 case "stop": exit(stopComponent(id: "connection"))
 case "stop-suite": exit(stopSuite())
+case "start-suite": exit(startSuite())
 case "restore-suite": exit(restoreSuite())
 default:
   if command.hasPrefix("stop-component:") {

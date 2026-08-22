@@ -98,7 +98,7 @@ private struct ComponentStatus: Identifiable, Equatable {
   var present = true
 
   var stateText: String {
-    if restartRequired { return "已停止 · 需要重启恢复" }
+    if restartRequired { return "已停止 · 可重新注册" }
     if !present { return "未安装" }
     if disabled, !loaded { return "已被策略禁用" }
     if loaded, pids.isEmpty { return "已加载 · 等待触发" }
@@ -126,7 +126,7 @@ private struct ComponentStatus: Identifiable, Equatable {
       detail: "EDR、AV、EDLP、防火墙、设备管控", launchOnlyOnce: false),
     ComponentStatus(
       id: "network-monitor", name: "网络监控", label: "com.corplink.networkmonitor",
-      detail: "LaunchOnlyOnce；停止后必须重启 Mac 才能可靠恢复", launchOnlyOnce: true),
+      detail: "LaunchOnlyOnce；再次启动会使用原始 plist 重新注册", launchOnlyOnce: true),
     ComponentStatus(
       id: "data-forwarder", name: "策略数据转发", label: "com.corplink.data_forwarder",
       detail: "每 300 秒按需运行的策略转发任务", launchOnlyOnce: false),
@@ -202,8 +202,8 @@ private final class ServiceController: ObservableObject {
 
   var isWorking: Bool { isBusy }
 
-  var canRestoreWithoutRestart: Bool {
-    restorePending.contains { $0 != "network-monitor" }
+  var canStartSuite: Bool {
+    components.contains { !$0.loaded && $0.present && !$0.disabled }
   }
 
   private var helperURL: URL? {
@@ -553,14 +553,14 @@ private struct ControlView: View {
 
       HStack(spacing: 12) {
         Button {
-          controller.perform("restore-suite")
+          controller.perform("start-suite")
         } label: {
           Label("开始", systemImage: "play.fill")
             .frame(minWidth: 96)
         }
         .buttonStyle(.borderedProminent)
         .controlSize(.large)
-        .disabled(controller.isWorking || !controller.canRestoreWithoutRestart)
+        .disabled(controller.isWorking || !controller.canStartSuite)
 
         Button(role: .destructive) {
           confirmStopSuite = true
@@ -600,7 +600,7 @@ private struct ControlView: View {
       Button("取消", role: .cancel) {}
       Button("停止", role: .destructive) { controller.perform("stop-suite") }
     } message: {
-      Text("将停止当前运行的连接、防护、网络代理、应用管控等组件。网络监控停止后需要重启 Mac 才能可靠恢复。")
+      Text("将停止全部已知飞连任务和相关进程。再次开始时会启动所有已安装且未被组织策略禁用的组件。")
     }
   }
 }
@@ -644,7 +644,7 @@ private struct ComponentsView: View {
             Spacer()
 
             if component.loaded || !component.pids.isEmpty {
-              Button(component.launchOnlyOnce ? "停止（需重启）" : "停止", role: .destructive) {
+              Button("停止", role: .destructive) {
                 componentToStop = component
               }
               .disabled(controller.isWorking)
@@ -653,8 +653,7 @@ private struct ComponentsView: View {
                 controller.perform("start-component:\(component.id)")
               }
               .disabled(
-                controller.isWorking || !component.present || component.disabled
-                  || component.restartRequired)
+                controller.isWorking || !component.present || component.disabled)
             }
           }
           .padding(14)
@@ -694,7 +693,7 @@ private struct ComponentsView: View {
       }
     } message: {
       if componentToStop?.launchOnlyOnce == true {
-        Text("此任务标记为 LaunchOnlyOnce，停止后必须重启 Mac 才能可靠恢复。")
+        Text("此任务标记为 LaunchOnlyOnce。再次启动时会使用飞连原始 plist 重新注册；若验证失败，重启 Mac 是可靠兜底。")
       } else {
         Text("将从对应 launchd domain 卸载任务，并验证没有相关进程残留。")
       }
@@ -748,9 +747,9 @@ private struct InformationView: View {
           .padding(10)
         }
 
-        GroupBox("停止与恢复边界") {
+        GroupBox("整套开关边界") {
           Text(
-            "停止整套会保存运行快照并逐项验证。网络监控使用 LaunchOnlyOnce，停止后必须重启 Mac 才能可靠恢复；被组织策略禁用的任务不会被强制启用。活跃 System Extension 不会被卸载，若仍存在就不会报告为干净停止。"
+            "停止整套会逐项卸载并验证；开始整套会启动所有已安装且未被组织策略禁用的组件，不参考停止前状态。网络监控使用飞连原始 plist 重新注册，失败时需重启 Mac。活跃 System Extension 不会被卸载，若仍存在就不会报告为干净停止。"
           )
           .font(.caption)
           .foregroundStyle(.secondary)
@@ -856,7 +855,7 @@ private struct AboutView: View {
         Label("在 GitHub 上查看", systemImage: "arrow.up.right.square")
       }
       Divider().frame(width: 320)
-      Text("本工具不会删除飞连文件或篡改组织禁用策略。停止整套时会保存恢复快照；LaunchOnlyOnce 组件需要重启 Mac 恢复。")
+      Text("本工具不会删除飞连文件或篡改组织禁用策略。开始会启动全部可用组件；网络监控重新注册失败时需要重启 Mac。")
         .font(.caption)
         .foregroundStyle(.secondary)
     }
@@ -882,8 +881,8 @@ private struct MenuBarView: View {
       }
 
       HStack {
-        Button("恢复整套") { controller.perform("restore-suite") }
-          .disabled(controller.isWorking || !controller.canRestoreWithoutRestart)
+        Button("启动整套") { controller.perform("start-suite") }
+          .disabled(controller.isWorking || !controller.canStartSuite)
         Button("刷新") { controller.refresh() }
           .disabled(controller.isWorking)
       }
