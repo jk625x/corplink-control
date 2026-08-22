@@ -6,6 +6,24 @@
 App 同时提供标准主窗口和可选菜单栏入口。主窗口包含控制、信息、设置和关于页面；
 可以设置登录时启动控制 App，以及是否显示菜单栏图标。
 
+## “停止”到底会停止什么
+
+“停止”会干净停止 `com.volcengine.corplink.service` 连接主服务：先通过飞连自带 CLI 主动断开
+VPN/SWG，再从 launchd system domain 卸载主服务，确认无主进程残留并观察 5 秒防止复活，最后恢复
+plist 原有的不可变属性。
+
+它**不是卸载或完全关闭整个飞连**。EDR、AV、EDLP、MDM、应用管控、网络监控等独立安全与合规组件
+仍可能继续运行，App 的“信息”页会单独列出这些组件。这样做是刻意的：其中
+`com.corplink.networkmonitor` 设置了 `LaunchOnlyOnce=true`，macOS 系统手册说明这类任务不能保证在不重启
+机器的情况下安全恢复。
+
+完整的原理、组件清单、验证标准和已知边界见
+[停止语义、原理与验证](docs/STOPPING.md)。也可以运行只读审计：
+
+```bash
+./scripts/audit-stop.sh
+```
+
 ## 安装
 
 仓库同时包含源码和 Homebrew Cask，不需要单独的 `homebrew-tap` 仓库：

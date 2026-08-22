@@ -7,6 +7,7 @@ private enum AppConstants {
   static let serviceLabel = "com.volcengine.corplink.service"
   static let plistPath = "/Library/LaunchDaemons/com.volcengine.corplink.service.plist"
   static let executablePath = "/usr/local/corplink/corplink-service"
+  static let cliPath = "/usr/local/corplink/corplink-cli"
   static let repositoryURL = URL(string: "https://github.com/jk625x/corplink-control")!
 }
 
@@ -19,9 +20,9 @@ private enum ServiceState: Equatable {
   var title: String {
     switch self {
     case .loading: return "正在检查…"
-    case .running: return "飞连服务正在运行"
-    case .stopped: return "飞连服务已停止"
-    case .inconsistent: return "服务状态异常"
+    case .running: return "飞连连接服务正在运行"
+    case .stopped: return "飞连连接服务已停止"
+    case .inconsistent: return "连接服务状态异常"
     }
   }
 
@@ -96,6 +97,12 @@ private final class ServiceController: ObservableObject {
   @Published var isBusy = false
   @Published var message: String?
   @Published var isError = false
+  @Published var vpnStatus = "检查中"
+  @Published var swgStatus = "检查中"
+  @Published var backgroundJobs: [String] = []
+  @Published var backgroundComponents: [String] = []
+  @Published var backgroundPIDs: [Int32] = []
+  @Published var activeSystemExtensions: [String] = []
 
   private var helperURL: URL? {
     Bundle.main.url(forResource: "corplink-root-helper", withExtension: nil)
@@ -119,11 +126,13 @@ private final class ServiceController: ObservableObject {
     isBusy = true
     message = nil
     Task {
+      let disconnectSummary = action == "stop" ? await Self.disconnectNetworkSessions() : nil
       let result = await Self.runWithAdministratorPrivileges(helperURL, action: action)
       isBusy = false
       if result.status == 0 {
         let text = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        showMessage(text.isEmpty ? "操作成功" : text, error: false)
+        let parts = [disconnectSummary, text.isEmpty ? "操作成功" : text].compactMap { $0 }
+        showMessage(parts.joined(separator: "\n"), error: false)
       } else {
         let detail = (result.stderr.isEmpty ? result.stdout : result.stderr)
           .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -143,6 +152,16 @@ private final class ServiceController: ObservableObject {
     let loaded = values["loaded"] == "true"
     let pids = (values["pids"] ?? "").split(separator: ",").compactMap { Int32($0) }
     flags = (values["flags"] ?? "").split(separator: ",").map(String.init)
+    vpnStatus = Self.connectionStatusText(values["vpn"] ?? "unknown")
+    swgStatus = Self.connectionStatusText(values["swg"] ?? "unknown")
+    backgroundJobs = (values["background_jobs"] ?? "").split(separator: ",").map(String.init)
+    backgroundComponents = (values["background_components"] ?? "").split(separator: ",").map(
+      String.init)
+    backgroundPIDs = (values["background_pids"] ?? "").split(separator: ",").compactMap {
+      Int32($0)
+    }
+    activeSystemExtensions = (values["system_extensions"] ?? "").split(separator: ",").map(
+      String.init)
 
     if loaded, !pids.isEmpty {
       state = .running(pids)
@@ -156,6 +175,28 @@ private final class ServiceController: ObservableObject {
   private func showMessage(_ text: String, error: Bool) {
     message = text
     isError = error
+  }
+
+  nonisolated private static func connectionStatusText(_ value: String) -> String {
+    switch value.lowercased() {
+    case "connected", "connecting", "reasserting": return "已连接"
+    case "disconnected", "disconnecting", "notsetup": return "未连接"
+    case "unavailable": return "主服务未运行，无法查询"
+    default: return "未知"
+    }
+  }
+
+  nonisolated private static func disconnectNetworkSessions() async -> String {
+    let cliURL = URL(fileURLWithPath: AppConstants.cliPath)
+    guard FileManager.default.isExecutableFile(atPath: cliURL.path) else {
+      return "未找到 corplink-cli，跳过 VPN/SWG 主动断开步骤。"
+    }
+
+    let vpnResult = await run(cliURL, arguments: ["vpn", "disconnect"])
+    let swgResult = await run(cliURL, arguments: ["swg", "disconnect"])
+    let vpnText = vpnResult.status == 0 ? "VPN 已主动断开" : "VPN 无活动连接或主服务未响应"
+    let swgText = swgResult.status == 0 ? "SWG 已主动断开" : "SWG 无活动连接或主服务未响应"
+    return "\(vpnText)；\(swgText)。"
   }
 
   nonisolated private static func run(_ executable: URL, arguments: [String]) async -> CommandResult
@@ -356,19 +397,19 @@ private struct ControlView: View {
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 22) {
-        PageHeader(title: "控制", subtitle: "启动或停止飞连后台服务")
+        PageHeader(title: "控制", subtitle: "干净地启动或停止飞连连接服务")
         StatusCard(controller: controller)
 
         GroupBox {
           HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
-              Text("飞连服务").font(.headline)
+              Text("飞连连接服务").font(.headline)
               Text("切换时会弹出 macOS 管理员授权窗口")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
             Spacer()
-            Toggle("飞连服务", isOn: serviceToggle)
+            Toggle("飞连连接服务", isOn: serviceToggle)
               .labelsHidden()
               .toggleStyle(.switch)
               .controlSize(.large)
@@ -414,9 +455,24 @@ private struct ControlView: View {
           .textSelection(.enabled)
         }
 
-        Text("服务配置包含 KeepAlive。停止操作会先移除 plist 的不可变属性，再从 system domain 卸载服务，避免进程被自动拉起。")
+        VStack(alignment: .leading, spacing: 6) {
+          Label("控制范围", systemImage: "checkmark.shield")
+            .font(.headline)
+          Text(
+            "停止会先请求 VPN 和 SWG 主动断开，再卸载连接主服务并观察 5 秒确认未复活。飞连的 EDR、AV、应用管控、MDM、网络监控等独立后台组件不会被本开关停用。"
+          )
           .font(.caption)
           .foregroundStyle(.secondary)
+          if !controller.backgroundComponents.isEmpty {
+            Text("当前仍运行的独立组件：\(controller.backgroundComponents.joined(separator: "、"))")
+              .font(.caption)
+              .foregroundStyle(.orange)
+          }
+        }
+        .padding(14)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .font(.caption)
+        .foregroundStyle(.secondary)
       }
       .padding(28)
       .frame(maxWidth: 720, alignment: .leading)
@@ -437,10 +493,29 @@ private struct InformationView: View {
             InfoRow(label: "服务标识", value: AppConstants.serviceLabel)
             Divider().gridCellColumns(2)
             InfoRow(label: "system domain", value: controller.state.domainText)
-            InfoRow(label: "进程 PID", value: controller.state.pidText)
+            InfoRow(label: "连接服务 PID", value: controller.state.pidText)
+            InfoRow(label: "VPN", value: controller.vpnStatus)
+            InfoRow(label: "SWG", value: controller.swgStatus)
             InfoRow(
               label: "plist 属性",
               value: controller.flags.isEmpty ? "无" : controller.flags.joined(separator: ", "))
+            Divider().gridCellColumns(2)
+            InfoRow(
+              label: "后台任务",
+              value: controller.backgroundJobs.isEmpty
+                ? "未检测到" : controller.backgroundJobs.joined(separator: "、"))
+            InfoRow(
+              label: "后台组件",
+              value: controller.backgroundComponents.isEmpty
+                ? "未检测到" : controller.backgroundComponents.joined(separator: "、"))
+            InfoRow(
+              label: "后台 PID",
+              value: controller.backgroundPIDs.isEmpty
+                ? "无" : controller.backgroundPIDs.map(String.init).joined(separator: ", "))
+            InfoRow(
+              label: "活跃系统扩展",
+              value: controller.activeSystemExtensions.isEmpty
+                ? "未检测到飞连扩展" : controller.activeSystemExtensions.joined(separator: ", "))
             Divider().gridCellColumns(2)
             InfoRow(label: "可执行文件", value: AppConstants.executablePath)
             InfoRow(label: "服务配置", value: AppConstants.plistPath)
@@ -508,7 +583,7 @@ private struct SettingsView: View {
             Text("当前状态：\(loginController.statusText)")
               .font(.caption)
               .foregroundStyle(.secondary)
-            Text("这里只控制“飞连控制”App 是否随登录启动，不会自动改变飞连服务的运行状态。")
+            Text("这里只控制“飞连控制”App 是否随登录启动，不会自动改变飞连连接服务的运行状态。")
               .font(.caption)
               .foregroundStyle(.secondary)
 
@@ -540,14 +615,14 @@ private struct AboutView: View {
         .foregroundStyle(.blue)
       Text("飞连控制").font(.largeTitle.bold())
       Text("版本 \(version)").foregroundStyle(.secondary)
-      Text("用于查看、启动和停止飞连 macOS 后台服务。")
+      Text("用于查看、启动和干净停止飞连 macOS 连接服务。")
         .multilineTextAlignment(.center)
         .foregroundStyle(.secondary)
       Link(destination: AppConstants.repositoryURL) {
         Label("在 GitHub 上查看", systemImage: "arrow.up.right.square")
       }
       Divider().frame(width: 320)
-      Text("本工具不会修改飞连应用本身。停止服务时需要管理员权限。")
+      Text("本工具不会卸载飞连，也不会停用其独立的 EDR、AV、MDM 等安全与合规组件。停止连接服务时需要管理员权限。")
         .font(.caption)
         .foregroundStyle(.secondary)
     }
