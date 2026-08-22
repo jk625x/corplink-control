@@ -9,11 +9,13 @@
 
 ```bash
 brew tap jk625x/corplink-control https://github.com/jk625x/corplink-control
-brew install --cask corplink-control
+brew trust --cask jk625x/corplink-control/corplink-control
+brew install --cask jk625x/corplink-control/corplink-control
 ```
 
 Homebrew 将第三方 Cask 仓库统称为 tap；这里的 tap 就是当前个人项目仓库，
-不会创建另一个仓库。
+不会创建另一个仓库。Homebrew 6 默认不加载未经信任的第三方 Cask，因此安装者需要明确执行一次
+`brew trust`；上面的命令只信任当前 Cask，而不是整个仓库。
 
 ## 构建
 
