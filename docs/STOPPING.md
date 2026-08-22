@@ -104,7 +104,7 @@ VPN/SWG、独立后台任务、相关进程和已激活的飞连 System Extensio
 | 检查项 | 结果 |
 | --- | --- |
 | 整套启动范围 | 不读取停止前运行范围；启动全部已安装且未被策略禁用的组件 |
-| 启动后任务 | 7 / 8 已加载；唯一未启动的是组织策略明确禁用的 MDM |
+| 启动后任务 | App 完成时为 7 / 8；当时 MDM 仍由策略禁用，因此 App 没有越权启动 |
 | 连接主服务 | `system/com.volcengine.corplink.service` 状态为 running，PID `73517`，`runs=1`，从未退出 |
 | NetworkMonitor | 使用未修改的原始 plist 重新 `bootstrap` 成功，状态为 running，PID `73495`，仍保留 `launch only once` 属性 |
 | 延时稳定性 | 25 秒后两个 PID 均未变化，两个任务仍为 `runs=1`、从未退出 |
@@ -112,6 +112,7 @@ VPN/SWG、独立后台任务、相关进程和已激活的飞连 System Extensio
 | VPN / SWG | 官方 CLI 均返回 disconnected；主服务状态接口已恢复可查询 |
 | 网络稳定性 | 延时观察前后的系统代理、DNS、规范化 IPv4 路由哈希完全一致 |
 | NetworkMonitor 日志 | 本次与重启前原始实例均报告无法取得 SSID 后跳过处理；不是重新注册引入的新错误，未出现崩溃或反复拉起 |
+| MDM 延迟策略同步 | 约两分钟后，系统日志明确记录由 `corplink-service` 自行调用 `launchctl` 将 MDM 设为 enabled；MDM 随后以 PID `74537` 稳定运行，最终达到 8 / 8。这个启用动作不是飞连控制执行的 |
 
 另使用无网络副作用的临时 `LaunchOnlyOnce` 用户任务验证了当前 macOS 行为：任务执行并退出后，使用同一原始
 plist 再次 `bootstrap` 能创建新任务实例并再次执行。测试后任务与临时文件均已移除。这个结果说明不必删除
