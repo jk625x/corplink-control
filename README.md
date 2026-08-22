@@ -3,6 +3,9 @@
 原生 macOS 菜单栏 App，用于查看、启动和停止
 `com.volcengine.corplink.service`。支持 Apple Silicon 和 Intel Mac。
 
+App 同时提供标准主窗口和可选菜单栏入口。主窗口包含控制、信息、设置和关于页面；
+可以设置登录时启动控制 App，以及是否显示菜单栏图标。
+
 ## 安装
 
 仓库同时包含源码和 Homebrew Cask，不需要单独的 `homebrew-tap` 仓库：
