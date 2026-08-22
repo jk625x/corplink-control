@@ -1,38 +1,29 @@
-# 飞连控制
+# Corplink Control
 
-原生 macOS App，用于逐项查看、启动和停止飞连的连接、防护、网络监控、MDM、
-网络代理、应用管控和客户端任务。支持 Apple Silicon 和 Intel Mac。
+Corplink Control is a native macOS app for inspecting, starting, and cleanly stopping the complete Corplink runtime. It covers the connection service, system protection, Network Monitor, MDM, policy forwarding, network agent, application control, and client login task. Universal builds support both Apple Silicon and Intel Macs.
 
-App 同时提供标准主窗口和可选菜单栏入口。主控制页只保留整套状态、服务数量以及开始、停止、刷新三个按钮；
-逐项 PID、属性和恢复条件放在组件与信息页。可以设置登录时启动控制 App，以及是否显示菜单栏图标。
-状态只在主窗口可见且 App 位于前台时每 30 秒静默刷新；自动刷新不会显示 loading 或禁用按钮。
-关闭窗口、最小化或切到后台后不会继续运行状态扫描，仅在再次打开主窗口或手动刷新时查询。
+The app opens in English by default and can be switched to Simplified Chinese in Settings.
 
-## 两种停止方式
+![Corplink Control main window](docs/images/control-en.png)
 
-“停止连接服务”会干净停止 `com.volcengine.corplink.service`：先通过飞连自带 CLI 主动断开
-VPN/SWG，再从 launchd system domain 卸载主服务，确认无主进程残留并观察 5 秒防止复活，最后恢复
-plist 原有的不可变属性。
+![Corplink Control settings](docs/images/settings-en.png)
 
-“停止整套”会逐项卸载 8 个已知 launchd 任务、清理对应孤立进程、恢复
-`schg/uchg`，并观察 5 秒。只有任务、进程和已知活跃 System Extension 都不存在时才显示“整套已干净停止”。
-它不会删除飞连文件，因此不是卸载。
+## What it provides
 
-“开始整套”不参考停止前状态，会启动全部已安装且未被系统或组织策略禁用的组件。对于设置了
-`LaunchOnlyOnce=true` 的 `com.corplink.networkmonitor`，App 使用飞连原始 plist 重新注册新的 launchd
-任务实例并验证进程；不会删除该安全标记或直接裸跑二进制。如果验证失败，重启 Mac 是可靠兜底。App 不会
-强制 enable 被策略禁用的任务；飞连主服务随后按组织策略自行启用组件属于厂商正常控制流程。
+- One clear **Start** action for the complete installed suite.
+- One verified **Stop** action for all known Corplink jobs and processes.
+- A compact main window with live service and process counts.
+- Detailed component state, PIDs, plist flags, disabled-policy state, and recovery information on secondary pages.
+- Optional menu bar icon for quick access.
+- A setting that decides whether closing the main window keeps the app running in the background or quits the entire app.
+- Optional launch at login.
+- English and Simplified Chinese interfaces; English is the default.
 
-完整的原理、组件清单、验证标准和已知边界见
-[停止语义、原理与验证](docs/STOPPING.md)。也可以运行只读审计：
+Status refreshes silently every 30 seconds only while the main window is visible and the app is active. Closing, minimizing, or putting the app in the background stops automatic status scans, keeping idle resource use low.
 
-```bash
-./scripts/audit-stop.sh
-```
+## Install with Homebrew
 
-## 安装
-
-仓库同时包含源码和 Homebrew Cask，不需要单独的 `homebrew-tap` 仓库：
+This personal GitHub repository contains both the source and the Homebrew Cask. No separate tap repository is required:
 
 ```bash
 brew tap jk625x/corplink-control https://github.com/jk625x/corplink-control
@@ -40,20 +31,45 @@ brew trust --cask jk625x/corplink-control/corplink-control
 brew install --cask jk625x/corplink-control/corplink-control
 ```
 
-Homebrew 将第三方 Cask 仓库统称为 tap；这里的 tap 就是当前个人项目仓库，
-不会创建另一个仓库。Homebrew 6 默认不加载未经信任的第三方 Cask，因此安装者需要明确执行一次
-`brew trust`；上面的命令只信任当前 Cask，而不是整个仓库。
+Homebrew calls any third-party formula or Cask repository a “tap”; the command above uses this project repository itself. Homebrew 6 requires explicit trust before loading a third-party Cask, so `brew trust --cask` trusts only this Cask.
 
-## 构建
+To upgrade later:
+
+```bash
+brew update
+brew upgrade --cask jk625x/corplink-control/corplink-control
+```
+
+To uninstall:
+
+```bash
+brew uninstall --cask jk625x/corplink-control/corplink-control
+```
+
+This build is ad-hoc signed and is not notarized with an Apple Developer ID. If macOS blocks the first launch, open **System Settings > Privacy & Security** and choose **Open Anyway**.
+
+## Start and stop semantics
+
+**Stop** cleanly stops the complete known Corplink suite. The helper asks the vendor CLI to disconnect VPN and SWG, unloads eight known jobs from the correct launchd domains, terminates only matching orphan processes, restores any original `schg` or `uchg` flags, and watches for five seconds to detect a restart. The UI reports a clean stop only when no known job, process, auxiliary process, or active known System Extension remains.
+
+**Start** does not restore a historical subset. It starts every installed component that is not disabled by macOS or organization policy, in dependency order, and verifies each result. For `com.corplink.networkmonitor`, which uses `LaunchOnlyOnce=true`, the helper registers a new launchd job from the vendor's unchanged original plist. It does not remove that safety flag or launch the binary directly. A Mac restart remains the safe fallback if registration verification fails.
+
+The app never deletes Corplink files and never force-enables a job disabled by policy. It is a reversible runtime controller, not an uninstaller.
+
+See [Stopping model, implementation, and verification](docs/STOPPING.md) for the component inventory, exact checks, live test evidence, and known boundaries. A read-only audit is also available:
+
+```bash
+./scripts/audit-stop.sh
+```
+
+## Build from source
+
+Requirements: macOS 13 or newer and the Swift toolchain included with Xcode Command Line Tools.
 
 ```bash
 ./build-app.sh
 ```
 
-构建产物位于 `dist/飞连控制.app`。直接打开后，菜单栏会出现盾牌图标。
-查看状态不需要权限；启动或停止服务时，macOS 会弹出管理员授权窗口。
+The universal app is created at `dist/Corplink Control.app`. Reading status does not require elevated privileges. macOS asks for administrator authorization only when a component is started or stopped.
 
-当前版本使用 AppleScript 的管理员授权机制，适合本机自用。由于还没有 Developer ID
-签名和公证，其他人的 Mac 首次打开时可能需要在“系统设置 → 隐私与安全性”中确认。
-正式分发时建议进一步使用 Developer ID 签名、公证，并将 helper 升级为
-ServiceManagement privileged helper。
+The current release uses AppleScript's administrator authorization flow, which is suitable for personal distribution. A larger public distribution should use Developer ID signing, notarization, and a ServiceManagement privileged helper.

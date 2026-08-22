@@ -1,17 +1,27 @@
 import Darwin
 import Foundation
 
+private let usesChinese =
+  ProcessInfo.processInfo.environment["CORPLINK_CONTROL_LANG"] == "zh-Hans"
+
+private func message(_ english: String, _ chinese: String) -> String {
+  usesChinese ? chinese : english
+}
+
 private enum JobDomain { case system, gui }
 
 private struct ManagedJob {
   let id: String
-  let name: String
+  let englishName: String
+  let chineseName: String
   let label: String
   let domain: JobDomain
   let plistPath: String
   let processPattern: String
   let launchOnlyOnce: Bool
   let expectsResidentProcess: Bool
+
+  var name: String { message(englishName, chineseName) }
 
   func domainName(uid: uid_t) -> String {
     domain == .system ? "system" : "gui/\(uid)"
@@ -22,56 +32,64 @@ private struct ManagedJob {
 
 private let jobs = [
   ManagedJob(
-    id: "connection", name: "连接主服务", label: "com.volcengine.corplink.service",
+    id: "connection", englishName: "Connection Service", chineseName: "连接主服务",
+    label: "com.volcengine.corplink.service",
     domain: .system, plistPath: "/Library/LaunchDaemons/com.volcengine.corplink.service.plist",
     processPattern: "^/usr/local/corplink/corplink-service([[:space:]]|$)",
     launchOnlyOnce: false, expectsResidentProcess: true),
   ManagedJob(
-    id: "protection", name: "系统防护", label: "com.volcengine.corplink.systemextension",
+    id: "protection", englishName: "System Protection", chineseName: "系统防护",
+    label: "com.volcengine.corplink.systemextension",
     domain: .system,
     plistPath: "/Library/LaunchDaemons/com.volcengine.corplink.systemextension.plist",
     processPattern: "^/Library/CorpLink/", launchOnlyOnce: false,
     expectsResidentProcess: true),
   ManagedJob(
-    id: "network-monitor", name: "网络监控", label: "com.corplink.networkmonitor",
+    id: "network-monitor", englishName: "Network Monitor", chineseName: "网络监控",
+    label: "com.corplink.networkmonitor",
     domain: .system, plistPath: "/Library/LaunchDaemons/com.corplink.networkmonitor.plist",
     processPattern: "^/usr/local/corplink/bin/NetworkMonitor([[:space:]]|$)",
     launchOnlyOnce: true, expectsResidentProcess: true),
   ManagedJob(
-    id: "data-forwarder", name: "策略数据转发", label: "com.corplink.data_forwarder",
+    id: "data-forwarder", englishName: "Policy Data Forwarder", chineseName: "策略数据转发",
+    label: "com.corplink.data_forwarder",
     domain: .system, plistPath: "/Library/LaunchDaemons/com.corplink.data_forwarder.plist",
     processPattern: "^/usr/local/corplink/mdm/.+policy_data_forwarder\\.rb([[:space:]]|$)",
     launchOnlyOnce: false, expectsResidentProcess: false),
   ManagedJob(
-    id: "mdm", name: "MDM 策略", label: "com.corplink.mdm.policy", domain: .system,
+    id: "mdm", englishName: "MDM Policy", chineseName: "MDM 策略",
+    label: "com.corplink.mdm.policy", domain: .system,
     plistPath: "/Library/LaunchDaemons/com.corplink.mdm.policy.plist",
     processPattern: "^/usr/local/corplink/mdm/.+/clpolicy agent([[:space:]]|$)",
     launchOnlyOnce: false, expectsResidentProcess: true),
   ManagedJob(
-    id: "network-agent", name: "网络扩展代理", label: "com.volcengine.corplink.agent",
+    id: "network-agent", englishName: "Network Extension Agent", chineseName: "网络扩展代理",
+    label: "com.volcengine.corplink.agent",
     domain: .gui, plistPath: "/Library/LaunchAgents/com.volcengine.corplink.agent.plist",
     processPattern:
       "^/Applications/CorpLink\\.app/Contents/Frameworks/CorplinkNe\\.app/Contents/MacOS/CorplinkNe([[:space:]]|$)",
     launchOnlyOnce: false, expectsResidentProcess: true),
   ManagedJob(
-    id: "app-blocker", name: "应用管控", label: "com.corplink.appblocker", domain: .gui,
+    id: "app-blocker", englishName: "Application Control", chineseName: "应用管控",
+    label: "com.corplink.appblocker", domain: .gui,
     plistPath: "/Library/LaunchAgents/com.corplink.appblocker.plist",
     processPattern: "^/usr/local/corplink/bin/appblocker([[:space:]]|$)",
     launchOnlyOnce: false, expectsResidentProcess: true),
   ManagedJob(
-    id: "client", name: "客户端登录项", label: "CorpLink", domain: .gui,
+    id: "client", englishName: "Client Login Item", chineseName: "客户端登录项",
+    label: "CorpLink", domain: .gui,
     plistPath: "~/Library/LaunchAgents/CorpLink.plist",
     processPattern: "^/Applications/CorpLink\\.app/Contents/MacOS/CorpLink([[:space:]]|$)",
     launchOnlyOnce: false, expectsResidentProcess: false),
 ]
 
 private let snapshotPath = "/Library/Application Support/CorplinkControl/restore-state.json"
-private let auxiliaryProcessPatterns = [
+private let auxiliaryProcessPatterns: [(englishName: String, chineseName: String, pattern: String)] = [
   (
-    "Finder Sync",
+    "Finder Sync", "Finder 同步扩展",
     "^/Applications/(CorpLink|SealSuite)\\.app/.+/CorpLink Finder Sync([[:space:]]|$)"
   ),
-  ("SealSuite 客户端", "^/Applications/SealSuite\\.app/Contents/MacOS/SealSuite([[:space:]]|$)"),
+  ("SealSuite Client", "SealSuite 客户端", "^/Applications/SealSuite\\.app/Contents/MacOS/SealSuite([[:space:]]|$)"),
 ]
 
 private struct RestoreSnapshot: Codable {
@@ -149,7 +167,10 @@ private func clearImmutableFlags(path: String) -> Set<String>? {
   for flag in protected.sorted() {
     let result = run("/usr/bin/chflags", ["no\(flag)", path])
     if result.status != 0 {
-      fputs("无法移除 \(path) 的 \(flag)：\(result.stderr)\n", stderr)
+      fputs(
+        message(
+          "Could not remove \(flag) from \(path): \(result.stderr)\n",
+          "无法移除 \(path) 的 \(flag)：\(result.stderr)\n"), stderr)
       return nil
     }
   }
@@ -160,7 +181,10 @@ private func restoreImmutableFlags(_ flags: Set<String>, path: String) -> Bool {
   for flag in flags.sorted() {
     let result = run("/usr/bin/chflags", [flag, path])
     if result.status != 0 {
-      fputs("无法恢复 \(path) 的 \(flag)：\(result.stderr)\n", stderr)
+      fputs(
+        message(
+          "Could not restore \(flag) on \(path): \(result.stderr)\n",
+          "无法恢复 \(path) 的 \(flag)：\(result.stderr)\n"), stderr)
       return false
     }
   }
@@ -201,7 +225,9 @@ private func terminateProcesses(_ job: ManagedJob) {
 private func auxiliaryProcesses() -> (names: [String], pids: [Int32]) {
   var names: [String] = []
   var pids = Set<Int32>()
-  for (name, pattern) in auxiliaryProcessPatterns {
+  for item in auxiliaryProcessPatterns {
+    let name = message(item.englishName, item.chineseName)
+    let pattern = item.pattern
     let result = run("/usr/bin/pgrep", ["-f", pattern])
     guard result.status == 0 else { continue }
     let matches = result.stdout.split(whereSeparator: { $0.isWhitespace }).compactMap { Int32($0) }
@@ -237,7 +263,10 @@ private func writeSnapshot(_ snapshot: RestoreSnapshot) -> Bool {
     _ = run("/bin/chmod", ["644", snapshotPath])
     return true
   } catch {
-    fputs("无法保存恢复快照：\(error.localizedDescription)\n", stderr)
+    fputs(
+      message(
+        "Could not save the recovery snapshot: \(error.localizedDescription)\n",
+        "无法保存恢复快照：\(error.localizedDescription)\n"), stderr)
     return false
   }
 }
@@ -259,7 +288,10 @@ private func restoreSavedPlistIfNeeded(_ job: ManagedJob, path: String, uid: uid
     _ = run("/bin/chmod", ["644", path])
     return FileManager.default.fileExists(atPath: path)
   } catch {
-    fputs("无法恢复 \(job.name) 的 plist：\(error.localizedDescription)\n", stderr)
+    fputs(
+      message(
+        "Could not restore the plist for \(job.name): \(error.localizedDescription)\n",
+        "无法恢复 \(job.name) 的 plist：\(error.localizedDescription)\n"), stderr)
     return false
   }
 }
@@ -324,11 +356,15 @@ private func stopJob(_ job: ManagedJob, uid: uid_t, recordRestore: Bool) -> Stri
   let pidsBefore = processPIDs(job)
   if !loadedBefore, pidsBefore.isEmpty { return nil }
   if recordRestore, loadedBefore, !addPendingRestore(job.id) {
-    return "\(job.name)：无法保存恢复状态，未执行停止"
+    return message(
+      "\(job.name): could not save recovery state; stop was not performed",
+      "\(job.name)：无法保存恢复状态，未执行停止")
   }
   let path = expandedPlistPath(for: job, uid: uid)
   guard let removedFlags = clearImmutableFlags(path: path) else {
-    return "\(job.name)：无法临时移除 plist 不可变属性"
+    return message(
+      "\(job.name): could not temporarily remove immutable plist flags",
+      "\(job.name)：无法临时移除 plist 不可变属性")
   }
   var error: String?
   if loadedBefore {
@@ -336,17 +372,25 @@ private func stopJob(_ job: ManagedJob, uid: uid_t, recordRestore: Bool) -> Stri
     if result.status != 0 {
       result = run("/bin/launchctl", ["bootout", job.domainName(uid: uid), path])
     }
-    if result.status != 0 { error = "\(job.name)：launchctl bootout 失败：\(result.stderr)" }
+    if result.status != 0 {
+      error = message(
+        "\(job.name): launchctl bootout failed: \(result.stderr)",
+        "\(job.name)：launchctl bootout 失败：\(result.stderr)")
+    }
   }
   if error == nil, !waitForJob(job, uid: uid, running: false, timeout: 3) {
     if !isLoaded(job, uid: uid), !processPIDs(job).isEmpty { terminateProcesses(job) }
     if !waitForJob(job, uid: uid, running: false, timeout: 3) {
-      error = "\(job.name)：任务或进程仍然存在"
+      error = message(
+        "\(job.name): the job or process is still present",
+        "\(job.name)：任务或进程仍然存在")
     }
   }
   if !restoreImmutableFlags(removedFlags, path: path) {
-    let flagError = "\(job.name)：plist 原有保护属性恢复失败"
-    error = error.map { "\($0)；\(flagError)" } ?? flagError
+    let flagError = message(
+      "\(job.name): failed to restore the original plist protection flags",
+      "\(job.name)：plist 原有保护属性恢复失败")
+    error = error.map { "\($0)\(message("; ", "；"))\(flagError)" } ?? flagError
   }
   return error
 }
@@ -355,17 +399,27 @@ private func startJob(_ job: ManagedJob, uid: uid_t) -> String? {
   let path = expandedPlistPath(for: job, uid: uid)
   if waitForJob(job, uid: uid, running: true, timeout: 0.1) {
     if !restoreSavedPlistIfNeeded(job, path: path, uid: uid) {
-      return "\(job.name)：任务已运行，但停止前的 plist 无法恢复"
+      return message(
+        "\(job.name): the job is running, but its saved plist could not be restored",
+        "\(job.name)：任务已运行，但停止前的 plist 无法恢复")
     }
     removePendingRestore(job.id)
     return nil
   }
-  if isDisabled(job, uid: uid) { return "\(job.name)：已被系统或组织策略禁用，未擅自修改" }
+  if isDisabled(job, uid: uid) {
+    return message(
+      "\(job.name): disabled by system or organization policy; no override was attempted",
+      "\(job.name)：已被系统或组织策略禁用，未擅自修改")
+  }
   guard restoreSavedPlistIfNeeded(job, path: path, uid: uid) else {
-    return "\(job.name)：找不到 plist，且没有可用的停止前备份"
+    return message(
+      "\(job.name): plist not found and no saved copy is available",
+      "\(job.name)：找不到 plist，且没有可用的停止前备份")
   }
   guard let removedFlags = clearImmutableFlags(path: path) else {
-    return "\(job.name)：无法临时移除 plist 不可变属性"
+    return message(
+      "\(job.name): could not temporarily remove immutable plist flags",
+      "\(job.name)：无法临时移除 plist 不可变属性")
   }
   var result = run("/bin/launchctl", ["bootstrap", job.domainName(uid: uid), path])
   if result.status != 0, isLoaded(job, uid: uid) {
@@ -373,63 +427,74 @@ private func startJob(_ job: ManagedJob, uid: uid_t) -> String? {
   }
   var error: String?
   if result.status != 0 {
-    error = "\(job.name)：启动失败：\(result.stderr)"
+    error = message(
+      "\(job.name): failed to start: \(result.stderr)",
+      "\(job.name)：启动失败：\(result.stderr)")
   } else if !waitForJob(job, uid: uid, running: true, timeout: 8) {
-    error = "\(job.name)：启动后验证失败"
+    error = message(
+      "\(job.name): post-start verification failed", "\(job.name)：启动后验证失败")
   } else {
     if job.id == "client" { Thread.sleep(forTimeInterval: 2) }
     if restoreSavedPlistIfNeeded(job, path: path, uid: uid) {
       removePendingRestore(job.id)
     } else {
-      error = "\(job.name)：已启动，但停止前的 plist 无法恢复"
+      error = message(
+        "\(job.name): started, but its saved plist could not be restored",
+        "\(job.name)：已启动，但停止前的 plist 无法恢复")
     }
   }
   if !restoreImmutableFlags(removedFlags, path: path) {
-    let flagError = "\(job.name)：plist 原有保护属性恢复失败"
-    error = error.map { "\($0)；\(flagError)" } ?? flagError
+    let flagError = message(
+      "\(job.name): failed to restore the original plist protection flags",
+      "\(job.name)：plist 原有保护属性恢复失败")
+    error = error.map { "\($0)\(message("; ", "；"))\(flagError)" } ?? flagError
   }
   return error
 }
 
 private func requireRoot(_ action: String) -> Bool {
   guard geteuid() == 0 else {
-    fputs("\(action)需要管理员权限。\n", stderr)
+    fputs(
+      message("Administrator privileges are required to \(action).\n", "\(action)需要管理员权限。\n"),
+      stderr)
     return false
   }
   return true
 }
 
 private func stopComponent(id: String) -> Int32 {
-  guard requireRoot("停止组件") else { return 77 }
+  guard requireRoot(message("stop a component", "停止组件")) else { return 77 }
   guard let job = jobs.first(where: { $0.id == id }) else {
-    fputs("未知组件：\(id)\n", stderr)
+    fputs(message("Unknown component: \(id)\n", "未知组件：\(id)\n"), stderr)
     return 2
   }
   if let error = stopJob(job, uid: consoleUID(), recordRestore: true) {
     fputs("\(error)\n", stderr)
     return 1
   }
-  let suffix = job.launchOnlyOnce ? "；再次启动时将使用原始 plist 重新注册" : ""
-  print("\(job.name)已停止，无任务或进程残留\(suffix)。")
+  let suffix = job.launchOnlyOnce
+    ? message("; it will be re-registered from the original plist when started", "；再次启动时将使用原始 plist 重新注册")
+    : ""
+  print(message("\(job.name) stopped with no job or process remaining\(suffix).", "\(job.name)已停止，无任务或进程残留\(suffix)。"))
   return 0
 }
 
 private func startComponent(id: String) -> Int32 {
-  guard requireRoot("启动组件") else { return 77 }
+  guard requireRoot(message("start a component", "启动组件")) else { return 77 }
   guard let job = jobs.first(where: { $0.id == id }) else {
-    fputs("未知组件：\(id)\n", stderr)
+    fputs(message("Unknown component: \(id)\n", "未知组件：\(id)\n"), stderr)
     return 2
   }
   if let error = startJob(job, uid: consoleUID()) {
     fputs("\(error)\n", stderr)
     return job.launchOnlyOnce ? 4 : 1
   }
-  print("\(job.name)已启动并通过验证。")
+  print(message("\(job.name) started and passed verification.", "\(job.name)已启动并通过验证。"))
   return 0
 }
 
 private func stopSuite() -> Int32 {
-  guard requireRoot("停止整套飞连") else { return 77 }
+  guard requireRoot(message("stop the complete Corplink suite", "停止整套飞连")) else { return 77 }
   let uid = consoleUID()
   let loadedIDs = Set(jobs.filter { isLoaded($0, uid: uid) }.map(\.id))
   let pendingIDs = loadedIDs.union(readSnapshot()?.pendingJobIDs ?? [])
@@ -462,27 +527,42 @@ private func stopSuite() -> Int32 {
     Thread.sleep(forTimeInterval: 0.5)
   }
   let residues = jobs.filter { isLoaded($0, uid: uid) || !processPIDs($0).isEmpty }.map(\.name)
-  if !residues.isEmpty { errors.append("仍有任务或进程：\(residues.joined(separator: "、"))") }
+  if !residues.isEmpty {
+    errors.append(
+      message(
+        "Jobs or processes remain: \(residues.joined(separator: ", "))",
+        "仍有任务或进程：\(residues.joined(separator: "、"))"))
+  }
   let auxiliaryResidues = auxiliaryProcesses()
   if !auxiliaryResidues.pids.isEmpty {
-    errors.append("仍有辅助进程：\(auxiliaryResidues.names.joined(separator: "、"))")
+    errors.append(
+      message(
+        "Auxiliary processes remain: \(auxiliaryResidues.names.joined(separator: ", "))",
+        "仍有辅助进程：\(auxiliaryResidues.names.joined(separator: "、"))"))
   }
   let extensions = activeRelatedSystemExtensions()
   if !extensions.isEmpty {
-    errors.append("仍有活跃 System Extension：\(extensions.joined(separator: ", "))；为保持可恢复性未执行卸载")
+    errors.append(
+      message(
+        "Active System Extensions remain: \(extensions.joined(separator: ", ")); they were not uninstalled so the operation remains reversible",
+        "仍有活跃 System Extension：\(extensions.joined(separator: ", "))；为保持可恢复性未执行卸载"))
   }
   guard errors.isEmpty else {
     fputs(errors.joined(separator: "\n") + "\n", stderr)
     return 1
   }
-  let monitorNote =
-    pendingIDs.contains("network-monitor") ? "；再次开始时会重新注册网络监控" : ""
-  print("整套飞连运行组件已停止；持续观察 5 秒未复活，无已知任务或进程残留\(monitorNote)。")
+  let monitorNote = pendingIDs.contains("network-monitor")
+    ? message("; Network Monitor will be re-registered on the next start", "；再次开始时会重新注册网络监控")
+    : ""
+  print(
+    message(
+      "The complete Corplink suite has stopped. No known job or process returned during the five-second observation\(monitorNote).",
+      "整套飞连运行组件已停止；持续观察 5 秒未复活，无已知任务或进程残留\(monitorNote)。"))
   return 0
 }
 
 private func startSuite() -> Int32 {
-  guard requireRoot("启动整套飞连") else { return 77 }
+  guard requireRoot(message("start the complete Corplink suite", "启动整套飞连")) else { return 77 }
   let uid = consoleUID()
   let startOrder = [
     "protection", "network-monitor", "connection", "mdm", "data-forwarder",
@@ -493,7 +573,7 @@ private func startSuite() -> Int32 {
   for id in startOrder {
     guard let job = jobs.first(where: { $0.id == id }) else { continue }
     if isDisabled(job, uid: uid) {
-      skipped.append("\(job.name)（策略禁用）")
+      skipped.append(message("\(job.name) (disabled by policy)", "\(job.name)（策略禁用）"))
       continue
     }
     if let error = startJob(job, uid: uid) { errors.append(error) }
@@ -502,15 +582,23 @@ private func startSuite() -> Int32 {
     fputs(errors.joined(separator: "\n") + "\n", stderr)
     return 1
   }
-  let skippedNote = skipped.isEmpty ? "" : "；未启动：\(skipped.joined(separator: "、"))"
-  print("所有已安装且未被策略禁用的飞连组件均已启动并通过验证\(skippedNote)。")
+  let skippedNote = skipped.isEmpty
+    ? ""
+    : message("; not started: \(skipped.joined(separator: ", "))", "；未启动：\(skipped.joined(separator: "、"))")
+  print(
+    message(
+      "All installed Corplink components not disabled by policy started and passed verification\(skippedNote).",
+      "所有已安装且未被策略禁用的飞连组件均已启动并通过验证\(skippedNote)。"))
   return 0
 }
 
 private func restoreSuite() -> Int32 {
-  guard requireRoot("恢复整套飞连") else { return 77 }
+  guard requireRoot(message("restore the Corplink suite", "恢复整套飞连")) else { return 77 }
   guard let snapshot = readSnapshot(), !snapshot.pendingJobIDs.isEmpty else {
-    fputs("没有待恢复的停止前状态。请在组件页逐项启动，或重启 Mac。\n", stderr)
+    fputs(
+      message(
+        "There is no saved pre-stop state to restore. Start components individually or restart the Mac.\n",
+        "没有待恢复的停止前状态。请在组件页逐项启动，或重启 Mac。\n"), stderr)
     return 2
   }
   let uid = consoleUID()
@@ -527,7 +615,10 @@ private func restoreSuite() -> Int32 {
     fputs(errors.joined(separator: "\n") + "\n", stderr)
     return 1
   }
-  print("已经恢复停止前运行的飞连组件，并逐项通过启动验证。")
+  print(
+    message(
+      "The Corplink components that were running before the stop have been restored and verified.",
+      "已经恢复停止前运行的飞连组件，并逐项通过启动验证。"))
   return 0
 }
 
@@ -575,30 +666,58 @@ private func printStatus() -> Int32 {
 }
 
 private func printHelp() {
-  print(
-    """
-    用法：corplink-root-helper <命令>
+  let componentList = jobs.map { "\($0.id) (\($0.name))" }.joined(separator: ", ")
+  if usesChinese {
+    print(
+      """
+      用法：corplink-root-helper <命令>
 
-    状态命令：
-      status                         输出整套及各组件实时状态（无需管理员权限）
+      状态命令：
+        status                         输出整套及各组件实时状态（无需管理员权限）
 
-    整套控制：
-      stop-suite                     保存运行快照并停止全部已知运行组件
-      start-suite                    启动全部已安装且未被策略禁用的组件
-      restore-suite                  恢复 stop-suite 前运行的组件
+      整套控制：
+        stop-suite                     保存运行快照并停止全部已知运行组件
+        start-suite                    启动全部已安装且未被策略禁用的组件
+        restore-suite                  恢复 stop-suite 前运行的组件
 
-    单项控制：
-      stop-component:<id>            停止一个组件并记录恢复状态
-      start-component:<id>           启动一个组件
+      单项控制：
+        stop-component:<id>            停止一个组件并记录恢复状态
+        start-component:<id>           启动一个组件
 
-    兼容命令：
-      start / stop                   启动或停止 connection 连接主服务
+      兼容命令：
+        start / stop                   启动或停止 connection 连接主服务
 
-    组件 id：
-      \(jobs.map { "\($0.id) (\($0.name))" }.joined(separator: ", "))
+      组件 id：
+        \(componentList)
 
-    注意：network-monitor 使用 LaunchOnlyOnce；重新启动时会用原始 plist 创建新的 launchd 任务实例。
-    """)
+      注意：network-monitor 使用 LaunchOnlyOnce；重新启动时会用原始 plist 创建新的 launchd 任务实例。
+      """)
+  } else {
+    print(
+      """
+      Usage: corplink-root-helper <command>
+
+      Status:
+        status                         Print live suite and component status (no admin privileges required)
+
+      Suite control:
+        stop-suite                     Save recovery state and stop all known running components
+        start-suite                    Start every installed component not disabled by policy
+        restore-suite                  Restore components that were running before stop-suite
+
+      Component control:
+        stop-component:<id>            Stop one component and record recovery state
+        start-component:<id>           Start one component
+
+      Compatibility commands:
+        start / stop                   Start or stop the connection service
+
+      Component IDs:
+        \(componentList)
+
+      Note: network-monitor uses LaunchOnlyOnce. Starting it registers a new launchd job from the original plist.
+      """)
+  }
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
@@ -624,7 +743,7 @@ default:
   if command.hasPrefix("start-component:") {
     exit(startComponent(id: String(command.dropFirst("start-component:".count))))
   }
-  fputs("未知命令：\(command)\n", stderr)
+  fputs(message("Unknown command: \(command)\n", "未知命令：\(command)\n"), stderr)
   printHelp()
   exit(2)
 }

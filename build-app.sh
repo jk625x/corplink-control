@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_DIR="$PROJECT_DIR/dist/飞连控制.app"
+APP_DIR="$PROJECT_DIR/dist/Corplink Control.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 SWIFT_BUILD=(/usr/bin/swift build -c release --arch arm64 --arch x86_64)
 

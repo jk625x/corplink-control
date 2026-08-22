@@ -1,12 +1,12 @@
 #!/bin/bash
 set -u
 
-APP_PATH="/Applications/飞连控制.app"
+APP_PATH="/Applications/Corplink Control.app"
 HELPER_PATH="$APP_PATH/Contents/Resources/corplink-root-helper"
 
 if [[ ! -x "$HELPER_PATH" ]]; then
-  echo "[✗] 找不到已安装的诊断 helper：$HELPER_PATH" >&2
-  echo "    请先安装或升级飞连控制 App。" >&2
+  echo "[x] Installed diagnostic helper not found: $HELPER_PATH" >&2
+  echo "    Install or upgrade Corplink Control first." >&2
   exit 2
 fi
 
@@ -20,22 +20,22 @@ echo
 
 case "$status_code" in
   0)
-    echo "[i] 至少有飞连组件正在运行，逐项状态见上方 job.*。"
+    echo "[i] At least one Corplink component is running. See job.* above for details."
     ;;
   3)
-    echo "[✓] 整套飞连已知任务、进程和活跃 System Extension 均未检测到。"
+    echo "[ok] No known Corplink job, process, or active System Extension was detected."
     ;;
   1)
-    echo "[✗] 至少一个 launchd 常驻任务与对应进程状态不一致。" >&2
+    echo "[x] At least one resident launchd job disagrees with its expected process state." >&2
     ;;
   *)
-    echo "[✗] 状态检查失败，退出码：$status_code" >&2
+    echo "[x] Status check failed with exit code $status_code." >&2
     ;;
 esac
 
 pending=$(printf '%s\n' "$status_output" | awk -F= '/^restore_pending=/{print substr($0, index($0, "=") + 1)}')
 if [[ -n "$pending" ]]; then
-  echo "[i] 停止前快照中仍待恢复：$pending"
+  echo "[i] Recovery state is still pending for: $pending"
 fi
 
 exit "$status_code"
