@@ -20,23 +20,22 @@ echo
 
 case "$status_code" in
   0)
-    echo "[i] 连接服务正在运行。"
+    echo "[i] 至少有飞连组件正在运行，逐项状态见上方 job.*。"
     ;;
   3)
-    echo "[✓] 连接服务已从 system domain 卸载，且没有主服务进程。"
+    echo "[✓] 整套飞连已知任务、进程和活跃 System Extension 均未检测到。"
     ;;
   1)
-    echo "[✗] launchd job 与主服务进程状态不一致。" >&2
+    echo "[✗] 至少一个 launchd 常驻任务与对应进程状态不一致。" >&2
     ;;
   *)
     echo "[✗] 状态检查失败，退出码：$status_code" >&2
     ;;
 esac
 
-background=$(printf '%s\n' "$status_output" | awk -F= '/^background_components=/{print substr($0, index($0, "=") + 1)}')
-if [[ -n "$background" ]]; then
-  echo "[i] 仍运行的独立飞连组件：$background"
-  echo "    这些组件不属于连接服务开关的控制范围，详见 docs/STOPPING.md。"
+pending=$(printf '%s\n' "$status_output" | awk -F= '/^restore_pending=/{print substr($0, index($0, "=") + 1)}')
+if [[ -n "$pending" ]]; then
+  echo "[i] 停止前快照中仍待恢复：$pending"
 fi
 
 exit "$status_code"

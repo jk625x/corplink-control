@@ -84,6 +84,67 @@ private enum ServiceState: Equatable {
   }
 }
 
+private struct ComponentStatus: Identifiable, Equatable {
+  let id: String
+  let name: String
+  let label: String
+  let detail: String
+  let launchOnlyOnce: Bool
+  var loaded = false
+  var pids: [Int32] = []
+  var flags: [String] = []
+  var disabled = false
+  var restartRequired = false
+  var present = true
+
+  var stateText: String {
+    if restartRequired { return "已停止 · 需要重启恢复" }
+    if !present { return "未安装" }
+    if disabled, !loaded { return "已被策略禁用" }
+    if loaded, pids.isEmpty { return "已加载 · 等待触发" }
+    if loaded { return "运行中" }
+    if !pids.isEmpty { return "异常 · 有残留进程" }
+    return "已停止"
+  }
+
+  var stateColor: Color {
+    if restartRequired || (!loaded && !pids.isEmpty) { return .orange }
+    if loaded { return .green }
+    return .secondary
+  }
+
+  var pidText: String {
+    pids.isEmpty ? "无" : pids.map(String.init).joined(separator: ", ")
+  }
+
+  static let definitions = [
+    ComponentStatus(
+      id: "connection", name: "连接主服务", label: "com.volcengine.corplink.service",
+      detail: "VPN、SWG 和飞连本地连接服务", launchOnlyOnce: false),
+    ComponentStatus(
+      id: "protection", name: "系统防护", label: "com.volcengine.corplink.systemextension",
+      detail: "EDR、AV、EDLP、防火墙、设备管控", launchOnlyOnce: false),
+    ComponentStatus(
+      id: "network-monitor", name: "网络监控", label: "com.corplink.networkmonitor",
+      detail: "LaunchOnlyOnce；停止后必须重启 Mac 才能可靠恢复", launchOnlyOnce: true),
+    ComponentStatus(
+      id: "data-forwarder", name: "策略数据转发", label: "com.corplink.data_forwarder",
+      detail: "每 300 秒按需运行的策略转发任务", launchOnlyOnce: false),
+    ComponentStatus(
+      id: "mdm", name: "MDM 策略", label: "com.corplink.mdm.policy",
+      detail: "组织设备管理策略；尊重系统中的禁用状态", launchOnlyOnce: false),
+    ComponentStatus(
+      id: "network-agent", name: "网络扩展代理", label: "com.volcengine.corplink.agent",
+      detail: "当前用户的 CorplinkNe 网络代理", launchOnlyOnce: false),
+    ComponentStatus(
+      id: "app-blocker", name: "应用管控", label: "com.corplink.appblocker",
+      detail: "当前用户的应用访问管控", launchOnlyOnce: false),
+    ComponentStatus(
+      id: "client", name: "客户端登录项", label: "CorpLink",
+      detail: "飞连客户端界面登录任务", launchOnlyOnce: false),
+  ]
+}
+
 private struct CommandResult {
   let status: Int32
   let stdout: String
@@ -95,40 +156,83 @@ private final class ServiceController: ObservableObject {
   @Published var state: ServiceState = .loading
   @Published var flags: [String] = []
   @Published var isBusy = false
+  @Published var isRefreshing = false
   @Published var message: String?
   @Published var isError = false
   @Published var vpnStatus = "检查中"
   @Published var swgStatus = "检查中"
-  @Published var backgroundJobs: [String] = []
-  @Published var backgroundComponents: [String] = []
-  @Published var backgroundPIDs: [Int32] = []
+  @Published var components = ComponentStatus.definitions
   @Published var activeSystemExtensions: [String] = []
+  @Published var suiteClean = false
+  @Published var suiteLoaded = 0
+  @Published var suiteTotal = ComponentStatus.definitions.count
+  @Published var suiteProcesses = 0
+  @Published var restorePending: [String] = []
+  @Published var auxiliaryComponents: [String] = []
+  @Published var auxiliaryPIDs: [Int32] = []
+  @Published var hasStatus = false
+
+  var suiteTitle: String {
+    if !hasStatus { return "正在检查整套飞连…" }
+    if suiteClean { return "飞连已停止" }
+    if suiteLoaded == 0 { return "飞连状态异常" }
+    return "飞连运行中"
+  }
+
+  var suiteDetail: String {
+    if !hasStatus { return "" }
+    return "已加载 \(suiteLoaded) / \(suiteTotal) 个服务 · \(suiteProcesses) 个进程"
+  }
+
+  var suiteSymbol: String {
+    if !hasStatus { return "arrow.clockwise" }
+    if suiteClean { return "shield.slash" }
+    if suiteLoaded > 0 { return "checkmark.shield.fill" }
+    return "exclamationmark.shield.fill"
+  }
+
+  var suiteColor: Color {
+    if !hasStatus { return .secondary }
+    if suiteClean { return .secondary }
+    if suiteLoaded > 0 { return .green }
+    return .orange
+  }
+
+  var isWorking: Bool { isBusy || isRefreshing }
+
+  var canRestoreWithoutRestart: Bool {
+    restorePending.contains { $0 != "network-monitor" }
+  }
 
   private var helperURL: URL? {
     Bundle.main.url(forResource: "corplink-root-helper", withExtension: nil)
   }
 
   func refresh() {
-    guard !isBusy, let helperURL else {
+    guard !isWorking, let helperURL else {
       if helperURL == nil {
         showMessage("App 内缺少控制 helper，请重新构建。", error: true)
       }
       return
     }
+    isRefreshing = true
     Task {
       let result = await Self.run(helperURL, arguments: ["status"])
       applyStatus(result)
+      isRefreshing = false
     }
   }
 
   func perform(_ action: String) {
-    guard !isBusy, let helperURL else { return }
+    guard !isWorking, let helperURL else { return }
     isBusy = true
     message = nil
     Task {
-      let disconnectSummary = action == "stop" ? await Self.disconnectNetworkSessions() : nil
+      let shouldDisconnect =
+        action == "stop" || action == "stop-suite"
+        || action == "stop-component:connection"
+      let disconnectSummary = shouldDisconnect ? await Self.disconnectNetworkSessions() : nil
       let result = await Self.runWithAdministratorPrivileges(helperURL, action: action)
-      isBusy = false
       if result.status == 0 {
         let text = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = [disconnectSummary, text.isEmpty ? "操作成功" : text].compactMap { $0 }
@@ -139,7 +243,9 @@ private final class ServiceController: ObservableObject {
         let cancelled = detail.contains("User canceled") || detail.contains("(-128)")
         showMessage(cancelled ? "已取消管理员授权" : (detail.isEmpty ? "操作失败" : detail), error: true)
       }
-      refresh()
+      let statusResult = await Self.run(helperURL, arguments: ["status"])
+      applyStatus(statusResult)
+      isBusy = false
     }
   }
 
@@ -149,19 +255,37 @@ private final class ServiceController: ObservableObject {
         let pair = row.split(separator: "=", maxSplits: 1).map(String.init)
         return pair.count == 2 ? (pair[0], pair[1]) : nil
       })
-    let loaded = values["loaded"] == "true"
-    let pids = (values["pids"] ?? "").split(separator: ",").compactMap { Int32($0) }
-    flags = (values["flags"] ?? "").split(separator: ",").map(String.init)
+    components = ComponentStatus.definitions.map { definition in
+      var component = definition
+      let fields = (values["job.\(definition.id)"] ?? "").split(
+        separator: "|", maxSplits: 5, omittingEmptySubsequences: false
+      ).map(String.init)
+      guard fields.count == 6 else { return component }
+      component.loaded = fields[0] == "1"
+      component.pids = fields[1].split(separator: ":").compactMap { Int32($0) }
+      component.flags = fields[2].split(separator: ":").map(String.init).filter { $0 != "-" }
+      component.disabled = fields[3] == "1"
+      component.restartRequired = fields[4] == "1"
+      component.present = fields[5] == "1"
+      return component
+    }
+    let connection = components.first { $0.id == "connection" } ?? ComponentStatus.definitions[0]
+    let loaded = connection.loaded
+    let pids = connection.pids
+    flags = connection.flags
     vpnStatus = Self.connectionStatusText(values["vpn"] ?? "unknown")
     swgStatus = Self.connectionStatusText(values["swg"] ?? "unknown")
-    backgroundJobs = (values["background_jobs"] ?? "").split(separator: ",").map(String.init)
-    backgroundComponents = (values["background_components"] ?? "").split(separator: ",").map(
+    suiteClean = values["suite_clean"] == "true"
+    suiteLoaded = Int(values["suite_loaded"] ?? "") ?? 0
+    suiteTotal = Int(values["suite_total"] ?? "") ?? ComponentStatus.definitions.count
+    suiteProcesses = Int(values["suite_processes"] ?? "") ?? 0
+    restorePending = (values["restore_pending"] ?? "").split(separator: ",").map(String.init)
+    auxiliaryComponents = (values["auxiliary_components"] ?? "").split(separator: ",").map(
       String.init)
-    backgroundPIDs = (values["background_pids"] ?? "").split(separator: ",").compactMap {
-      Int32($0)
-    }
+    auxiliaryPIDs = (values["auxiliary_pids"] ?? "").split(separator: ",").compactMap { Int32($0) }
     activeSystemExtensions = (values["system_extensions"] ?? "").split(separator: ",").map(
       String.init)
+    hasStatus = true
 
     if loaded, !pids.isEmpty {
       state = .running(pids)
@@ -245,6 +369,7 @@ private final class ServiceController: ObservableObject {
 
 private enum SidebarItem: String, CaseIterable, Identifiable {
   case control = "控制"
+  case components = "组件"
   case information = "信息"
   case settings = "设置"
   case about = "关于"
@@ -254,6 +379,7 @@ private enum SidebarItem: String, CaseIterable, Identifiable {
   var symbol: String {
     switch self {
     case .control: return "switch.2"
+    case .components: return "square.stack.3d.up"
     case .information: return "info.circle"
     case .settings: return "gearshape"
     case .about: return "app.badge"
@@ -328,6 +454,8 @@ private struct MainWindowView: View {
         switch selection ?? .control {
         case .control:
           ControlView(controller: controller)
+        case .components:
+          ComponentsView(controller: controller)
         case .information:
           InformationView(controller: controller)
         case .settings:
@@ -363,21 +491,21 @@ private struct StatusCard: View {
     HStack(spacing: 16) {
       ZStack {
         RoundedRectangle(cornerRadius: 14)
-          .fill(controller.state.color.opacity(0.13))
-        Image(systemName: controller.state.symbol)
+          .fill(controller.suiteColor.opacity(0.13))
+        Image(systemName: controller.suiteSymbol)
           .font(.system(size: 32, weight: .semibold))
-          .foregroundStyle(controller.state.color)
+          .foregroundStyle(controller.suiteColor)
       }
       .frame(width: 64, height: 64)
 
       VStack(alignment: .leading, spacing: 5) {
-        Text(controller.state.title).font(.title3.bold())
-        Text(controller.state.detail)
+        Text(controller.suiteTitle).font(.title3.bold())
+        Text(controller.suiteDetail)
           .font(.callout)
           .foregroundStyle(.secondary)
       }
       Spacer()
-      if controller.isBusy { ProgressView() }
+      if controller.isWorking { ProgressView() }
     }
     .padding(18)
     .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 16))
@@ -386,96 +514,160 @@ private struct StatusCard: View {
 
 private struct ControlView: View {
   @ObservedObject var controller: ServiceController
+  @State private var confirmStopSuite = false
 
-  private var serviceToggle: Binding<Bool> {
-    Binding(
-      get: { controller.state.isRunning },
-      set: { controller.perform($0 ? "start" : "stop") }
-    )
+  var body: some View {
+    VStack(alignment: .leading, spacing: 24) {
+      PageHeader(title: "控制", subtitle: "一键开始或停止飞连")
+      StatusCard(controller: controller)
+
+      HStack(spacing: 12) {
+        Button {
+          controller.perform("restore-suite")
+        } label: {
+          Label("开始", systemImage: "play.fill")
+            .frame(minWidth: 96)
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
+        .disabled(controller.isWorking || !controller.canRestoreWithoutRestart)
+
+        Button(role: .destructive) {
+          confirmStopSuite = true
+        } label: {
+          Label("停止", systemImage: "stop.fill")
+            .frame(minWidth: 96)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.large)
+        .disabled(controller.isWorking || controller.suiteClean)
+
+        Button {
+          controller.refresh()
+        } label: {
+          Label("刷新", systemImage: "arrow.clockwise")
+            .frame(minWidth: 80)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.large)
+        .disabled(controller.isWorking)
+      }
+
+      if let message = controller.message {
+        Label(
+          message, systemImage: controller.isError ? "xmark.circle.fill" : "checkmark.circle.fill"
+        )
+        .font(.callout)
+        .foregroundStyle(controller.isError ? .red : .secondary)
+        .textSelection(.enabled)
+      }
+
+      Spacer()
+    }
+    .padding(32)
+    .frame(maxWidth: 720, maxHeight: .infinity, alignment: .topLeading)
+    .alert("确定停止整套飞连？", isPresented: $confirmStopSuite) {
+      Button("取消", role: .cancel) {}
+      Button("停止", role: .destructive) { controller.perform("stop-suite") }
+    } message: {
+      Text("将停止当前运行的连接、防护、网络代理、应用管控等组件。网络监控停止后需要重启 Mac 才能可靠恢复。")
+    }
   }
+}
+
+private struct ComponentsView: View {
+  @ObservedObject var controller: ServiceController
+  @State private var componentToStop: ComponentStatus?
 
   var body: some View {
     ScrollView {
-      VStack(alignment: .leading, spacing: 22) {
-        PageHeader(title: "控制", subtitle: "干净地启动或停止飞连连接服务")
-        StatusCard(controller: controller)
+      VStack(alignment: .leading, spacing: 18) {
+        PageHeader(title: "组件", subtitle: "逐项查看任务、进程、保护属性和恢复条件")
 
-        GroupBox {
-          HStack(spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
-              Text("飞连连接服务").font(.headline)
-              Text("切换时会弹出 macOS 管理员授权窗口")
-                .font(.caption)
+        ForEach(controller.components) { component in
+          HStack(alignment: .center, spacing: 14) {
+            Circle()
+              .fill(component.stateColor)
+              .frame(width: 10, height: 10)
+
+            VStack(alignment: .leading, spacing: 5) {
+              HStack(spacing: 8) {
+                Text(component.name).font(.headline)
+                Text(component.stateText)
+                  .font(.caption.weight(.semibold))
+                  .foregroundStyle(component.stateColor)
+              }
+              Text(component.label)
+                .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+              Text(component.detail).font(.caption).foregroundStyle(.secondary)
+              HStack(spacing: 14) {
+                Text("PID：\(component.pidText)")
+                Text(
+                  "属性：\(component.flags.isEmpty ? "无" : component.flags.joined(separator: ", "))")
+              }
+              .font(.caption2.monospaced())
+              .foregroundStyle(.secondary)
             }
+
             Spacer()
-            Toggle("飞连连接服务", isOn: serviceToggle)
-              .labelsHidden()
-              .toggleStyle(.switch)
-              .controlSize(.large)
-              .disabled(controller.isBusy || controller.state.isLoading)
+
+            if component.loaded || !component.pids.isEmpty {
+              Button(component.launchOnlyOnce ? "停止（需重启）" : "停止", role: .destructive) {
+                componentToStop = component
+              }
+              .disabled(controller.isWorking)
+            } else {
+              Button("启动") {
+                controller.perform("start-component:\(component.id)")
+              }
+              .disabled(
+                controller.isWorking || !component.present || component.disabled
+                  || component.restartRequired)
+            }
           }
-          .padding(8)
+          .padding(14)
+          .background(
+            Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
         }
 
-        HStack(spacing: 12) {
-          Button {
-            controller.perform("start")
-          } label: {
-            Label("启动服务", systemImage: "play.fill")
-              .frame(minWidth: 110)
-          }
-          .buttonStyle(.borderedProminent)
-          .disabled(controller.isBusy || controller.state.isRunning)
-
-          Button {
-            controller.perform("stop")
-          } label: {
-            Label("停止服务", systemImage: "stop.fill")
-              .frame(minWidth: 110)
-          }
-          .buttonStyle(.bordered)
-          .disabled(controller.isBusy || controller.state.isStopped)
-
+        HStack {
           Button {
             controller.refresh()
           } label: {
-            Label("刷新", systemImage: "arrow.clockwise")
+            Label("刷新全部状态", systemImage: "arrow.clockwise")
           }
-          .buttonStyle(.bordered)
-          .disabled(controller.isBusy)
+          .disabled(controller.isWorking)
+          Spacer()
+          Text("状态每 5 秒自动刷新")
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
-
-        if let message = controller.message {
-          Label(
-            message, systemImage: controller.isError ? "xmark.circle.fill" : "checkmark.circle.fill"
-          )
-          .font(.callout)
-          .foregroundStyle(controller.isError ? .red : .secondary)
-          .textSelection(.enabled)
-        }
-
-        VStack(alignment: .leading, spacing: 6) {
-          Label("控制范围", systemImage: "checkmark.shield")
-            .font(.headline)
-          Text(
-            "停止会先请求 VPN 和 SWG 主动断开，再卸载连接主服务并观察 5 秒确认未复活。飞连的 EDR、AV、应用管控、MDM、网络监控等独立后台组件不会被本开关停用。"
-          )
-          .font(.caption)
-          .foregroundStyle(.secondary)
-          if !controller.backgroundComponents.isEmpty {
-            Text("当前仍运行的独立组件：\(controller.backgroundComponents.joined(separator: "、"))")
-              .font(.caption)
-              .foregroundStyle(.orange)
-          }
-        }
-        .padding(14)
-        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-        .font(.caption)
-        .foregroundStyle(.secondary)
       }
       .padding(28)
-      .frame(maxWidth: 720, alignment: .leading)
+      .frame(maxWidth: 820, alignment: .leading)
+    }
+    .alert(
+      "停止\(componentToStop?.name ?? "组件")？",
+      isPresented: Binding(
+        get: { componentToStop != nil },
+        set: { if !$0 { componentToStop = nil } }
+      )
+    ) {
+      Button("取消", role: .cancel) { componentToStop = nil }
+      Button("停止", role: .destructive) {
+        if let componentToStop {
+          controller.perform("stop-component:\(componentToStop.id)")
+        }
+        componentToStop = nil
+      }
+    } message: {
+      if componentToStop?.launchOnlyOnce == true {
+        Text("此任务标记为 LaunchOnlyOnce，停止后必须重启 Mac 才能可靠恢复。")
+      } else {
+        Text("将从对应 launchd domain 卸载任务，并验证没有相关进程残留。")
+      }
     }
   }
 }
@@ -490,8 +682,11 @@ private struct InformationView: View {
 
         GroupBox {
           Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 14) {
-            InfoRow(label: "服务标识", value: AppConstants.serviceLabel)
+            InfoRow(label: "整套状态", value: controller.suiteClean ? "已干净停止" : "有组件运行")
+            InfoRow(label: "加载任务", value: "\(controller.suiteLoaded) / \(controller.suiteTotal)")
+            InfoRow(label: "相关进程", value: String(controller.suiteProcesses))
             Divider().gridCellColumns(2)
+            InfoRow(label: "连接标识", value: AppConstants.serviceLabel)
             InfoRow(label: "system domain", value: controller.state.domainText)
             InfoRow(label: "连接服务 PID", value: controller.state.pidText)
             InfoRow(label: "VPN", value: controller.vpnStatus)
@@ -501,17 +696,17 @@ private struct InformationView: View {
               value: controller.flags.isEmpty ? "无" : controller.flags.joined(separator: ", "))
             Divider().gridCellColumns(2)
             InfoRow(
-              label: "后台任务",
-              value: controller.backgroundJobs.isEmpty
-                ? "未检测到" : controller.backgroundJobs.joined(separator: "、"))
+              label: "待恢复组件",
+              value: controller.restorePending.isEmpty
+                ? "无" : controller.restorePending.joined(separator: ", "))
             InfoRow(
-              label: "后台组件",
-              value: controller.backgroundComponents.isEmpty
-                ? "未检测到" : controller.backgroundComponents.joined(separator: "、"))
+              label: "辅助进程",
+              value: controller.auxiliaryComponents.isEmpty
+                ? "无" : controller.auxiliaryComponents.joined(separator: "、"))
             InfoRow(
-              label: "后台 PID",
-              value: controller.backgroundPIDs.isEmpty
-                ? "无" : controller.backgroundPIDs.map(String.init).joined(separator: ", "))
+              label: "辅助 PID",
+              value: controller.auxiliaryPIDs.isEmpty
+                ? "无" : controller.auxiliaryPIDs.map(String.init).joined(separator: ", "))
             InfoRow(
               label: "活跃系统扩展",
               value: controller.activeSystemExtensions.isEmpty
@@ -523,12 +718,21 @@ private struct InformationView: View {
           .padding(10)
         }
 
+        GroupBox("停止与恢复边界") {
+          Text(
+            "停止整套会保存运行快照并逐项验证。网络监控使用 LaunchOnlyOnce，停止后必须重启 Mac 才能可靠恢复；被组织策略禁用的任务不会被强制启用。活跃 System Extension 不会被卸载，若仍存在就不会报告为干净停止。"
+          )
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .padding(8)
+        }
+
         Button {
           controller.refresh()
         } label: {
           Label("刷新信息", systemImage: "arrow.clockwise")
         }
-        .disabled(controller.isBusy)
+        .disabled(controller.isWorking)
       }
       .padding(28)
       .frame(maxWidth: 760, alignment: .leading)
@@ -615,14 +819,14 @@ private struct AboutView: View {
         .foregroundStyle(.blue)
       Text("飞连控制").font(.largeTitle.bold())
       Text("版本 \(version)").foregroundStyle(.secondary)
-      Text("用于查看、启动和干净停止飞连 macOS 连接服务。")
+      Text("用于逐项查看、启动和干净停止飞连 macOS 运行组件。")
         .multilineTextAlignment(.center)
         .foregroundStyle(.secondary)
       Link(destination: AppConstants.repositoryURL) {
         Label("在 GitHub 上查看", systemImage: "arrow.up.right.square")
       }
       Divider().frame(width: 320)
-      Text("本工具不会卸载飞连，也不会停用其独立的 EDR、AV、MDM 等安全与合规组件。停止连接服务时需要管理员权限。")
+      Text("本工具不会删除飞连文件或篡改组织禁用策略。停止整套时会保存恢复快照；LaunchOnlyOnce 组件需要重启 Mac 恢复。")
         .font(.caption)
         .foregroundStyle(.secondary)
     }
@@ -638,22 +842,20 @@ private struct MenuBarView: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 14) {
       HStack(spacing: 10) {
-        Image(systemName: controller.state.symbol)
+        Image(systemName: controller.suiteSymbol)
           .font(.title2)
-          .foregroundStyle(controller.state.color)
+          .foregroundStyle(controller.suiteColor)
         VStack(alignment: .leading, spacing: 2) {
-          Text(controller.state.title).font(.headline)
-          Text(controller.state.detail).font(.caption).foregroundStyle(.secondary)
+          Text(controller.suiteTitle).font(.headline)
+          Text(controller.suiteDetail).font(.caption).foregroundStyle(.secondary)
         }
       }
 
       HStack {
-        Button("启动") { controller.perform("start") }
-          .disabled(controller.isBusy || controller.state.isRunning)
-        Button("停止") { controller.perform("stop") }
-          .disabled(controller.isBusy || controller.state.isStopped)
+        Button("恢复整套") { controller.perform("restore-suite") }
+          .disabled(controller.isWorking || !controller.canRestoreWithoutRestart)
         Button("刷新") { controller.refresh() }
-          .disabled(controller.isBusy)
+          .disabled(controller.isWorking)
       }
 
       Divider()
@@ -684,7 +886,7 @@ private struct CorplinkControlApp: App {
     }
     .defaultSize(width: 760, height: 520)
 
-    MenuBarExtra("飞连控制", systemImage: controller.state.symbol, isInserted: $showMenuBarItem) {
+    MenuBarExtra("飞连控制", systemImage: controller.suiteSymbol, isInserted: $showMenuBarItem) {
       MenuBarView(controller: controller)
     }
     .menuBarExtraStyle(.window)

@@ -2,22 +2,26 @@
 
 ## 先说结论
 
-“停止”表示**干净停止飞连的连接主服务**，不表示卸载飞连，也不表示关闭飞连的全部安全与合规组件。
+App 提供两种语义明确的操作：
+
+- **停止连接服务**：只停止 VPN/SWG 和 `com.volcengine.corplink.service`，可以热启动恢复。
+- **停止整套**：停止下表中的全部已知运行任务和进程，但不删除飞连文件；恢复时按停止前快照逐项恢复。
 
 在 2026-08-23 对 macOS 26.6.2、CorpLink 3.3.15 的实机审计中，飞连至少安装了以下独立任务：
 
-| launchd 标签 | 作用或可执行文件 | 本工具的“停止”是否处理 |
-| --- | --- | --- |
-| `com.volcengine.corplink.service` | 连接主服务 `corplink-service` | 是 |
-| `com.volcengine.corplink.systemextension` | firewall、EDR、EDLP、AV、设备管控等 | 否 |
-| `com.corplink.networkmonitor` | `NetworkMonitor` | 否 |
-| `com.corplink.data_forwarder` | 策略数据转发 | 否 |
-| `com.corplink.mdm.policy` | MDM 策略 | 否 |
-| `com.volcengine.corplink.agent` | `CorplinkNe` 网络扩展代理 | 否 |
-| `com.corplink.appblocker` | 应用管控 | 否 |
-| `CorpLink` | 用户登录项 | 否 |
+| launchd 标签 | 作用或可执行文件 | 连接服务停止 | 整套停止 |
+| --- | --- | --- | --- |
+| `com.volcengine.corplink.service` | 连接主服务 `corplink-service` | 是 | 是 |
+| `com.volcengine.corplink.systemextension` | firewall、EDR、EDLP、AV、设备管控等 | 否 | 是 |
+| `com.corplink.networkmonitor` | `NetworkMonitor` | 否 | 是；恢复需重启 |
+| `com.corplink.data_forwarder` | 策略数据转发 | 否 | 是 |
+| `com.corplink.mdm.policy` | MDM 策略 | 否 | 是 |
+| `com.volcengine.corplink.agent` | `CorplinkNe` 网络扩展代理 | 否 | 是 |
+| `com.corplink.appblocker` | 应用管控 | 否 | 是 |
+| `CorpLink` | 用户登录项 | 否 | 是 |
 
-因此，界面会分别展示“连接服务”和“独立后台组件”，不会把主服务停止误报成“整个飞连完全退出”。
+界面逐项展示每个任务是否加载、PID、plist 属性、策略禁用状态以及是否需要重启，不会把部分停止误报成
+整套退出。
 
 ## 为什么不能把所有进程直接杀掉
 
@@ -25,12 +29,33 @@
 会要求 launchd 持续维持进程；只执行 `kill` 或 `launchctl stop`，进程会被再次拉起。
 
 `com.corplink.networkmonitor` 还设置了 `LaunchOnlyOnce=true`。系统手册将它定义为：任务不能在不完整重启
-机器的情况下安全地再次运行。因此，本工具不会为了追求“进程列表看起来为空”而停止这类组件，否则按钮上的
-“启动”无法保证恢复飞连原有的 EDR、AV、MDM、网络监控等能力。
+机器的情况下安全地再次运行。因此整套停止可以把它关掉，但恢复页会明确要求重启 Mac，而不会尝试不可靠的
+热启动。
 
 需要彻底移除全部组件时，应使用组织管理员认可的飞连卸载流程。飞连 3.3.15 自带的
 `/usr/local/corplink/uninstall.sh` 也采用了卸载 Network Extension、停止守护任务并删除组件的流程；
 它不是普通的可逆开关。
+
+## 整套停止与恢复
+
+整套停止执行以下流程：
+
+1. 用官方 CLI 请求 VPN、SWG 主动断开。
+2. 保存当前已加载任务的恢复快照；原本关闭或被策略禁用的任务不加入恢复列表。
+3. 先停用户层客户端、网络代理和应用管控，再停 system domain 中的连接、策略、网络监控和系统防护任务。
+4. 每个任务都使用其准确的 launchd domain 执行 `bootout`，而不是只杀进程。
+5. 若任务已卸载但对应进程仍在，先 `SIGTERM`，两秒后才对残留进程使用 `SIGKILL`。
+6. 每个 plist 只临时移除原先实际存在的 `schg/uchg`，操作后恢复完全相同的属性集合。
+7. 全部处理后再观察 5 秒；任何任务或进程复活都会判为失败。
+8. 如果检测到仍活跃的飞连 System Extension，也不会报告“干净停止”。为了保持可恢复性，本工具不会把
+   System Extension 执行卸载；彻底注销它属于卸载语义。
+
+恢复时只读取快照中原先运行的项目，按系统防护、连接、策略、用户代理和客户端的依赖顺序执行
+`launchctl bootstrap`，并逐项验证。系统或组织策略标记为 disabled 的任务不会被强制 enable。
+
+整套只有同时满足以下条件才显示为“已干净停止”：8 个已知任务均未加载、对应已知进程及
+Finder Sync / SealSuite 辅助进程全部不存在、没有已激活的已知飞连 System Extension。plist 和 App 文件仍保留，因为这是
+停止而不是卸载。
 
 ## 干净停止连接服务的步骤
 
@@ -64,11 +89,35 @@ VPN/SWG、独立后台任务、相关进程和已激活的飞连 System Extensio
 ./scripts/audit-stop.sh
 ```
 
-脚本退出码：`0` 表示连接服务正在运行，`3` 表示连接服务已停止，`1` 表示 job 与进程状态不一致。
+脚本退出码：`0` 表示至少有整套组件正在运行且状态一致，`3` 表示所有已知任务、进程及活跃扩展均不存在，
+`1` 表示任务与常驻进程状态不一致。
 
 ## 2026-08-23 实机闭环验证
 
-验证环境：macOS 26.6.2、CorpLink 3.3.15、飞连控制 1.2.0。测试不是只看一次按钮状态，
+### 整套停止与恢复（1.3.0）
+
+验证环境：macOS 26.6.2、CorpLink 3.3.15、飞连控制 1.3.0。连续执行了两轮真实的
+“停止整套 → 延时审计 → 恢复停止前状态”：
+
+| 检查项 | 结果 |
+| --- | --- |
+| 停止前基线 | 8 个任务中 6 个已加载，12 个已知相关进程；MDM 原本由策略禁用，连接主服务原本已停止 |
+| 停止后任务与进程 | 0 / 8 已加载、0 个已知相关进程，helper 退出码为 `3` |
+| 防复活观察 | 内置 5 秒观察通过；额外的 8 秒和 20 秒延时复查仍保持 0 / 8、0 进程 |
+| System Extension | 未发现 `activated enabled` 的已知飞连 System Extension |
+| plist 保护 | 三个原有 `schg` 的 plist 在停止后均恢复为 `schg` |
+| 网络配置 | DNS、系统代理、规范化 IPv4 路由和 IPv6 路由最终均与停止前基线一致；IPv4 `utun` 路由为 0 |
+| 恢复结果 | 系统防护、策略转发、网络代理、应用管控和客户端均恢复；原本关闭的连接服务和原本禁用的 MDM 未被擅自开启 |
+| NetworkMonitor | 正确保留为“需要重启恢复”，恢复快照中只剩 `network-monitor` |
+| 用户登录项 | 第二轮快照保存 plist 原始字节；恢复后 `CorpLink.plist` 格式有效、所有者 `sunyi:staff`、权限 `0644`，延时复查仍存在 |
+
+第一轮恢复时发现 CorpLink 客户端启动后会删除旧的用户 LaunchAgent 文件。1.3.0 因此增加了登录项原始字节、
+所有者和权限的快照恢复，并通过第二轮真实停止/恢复验证。这个修复避免了“当前进程恢复，但下次登录无法启动”
+的隐蔽问题。
+
+### 连接服务停止（1.2.0）
+
+以下是连接服务模式的验证，环境为 macOS 26.6.2、CorpLink 3.3.15、飞连控制 1.2.0。测试不是只看一次按钮状态，
 而是实际执行一次“启动 → 停止”，随后再次延时检查。结果如下：
 
 | 检查项 | 结果 |

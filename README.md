@@ -1,21 +1,24 @@
 # 飞连控制
 
-原生 macOS 菜单栏 App，用于查看、启动和停止
-`com.volcengine.corplink.service`。支持 Apple Silicon 和 Intel Mac。
+原生 macOS App，用于逐项查看、启动和停止飞连的连接、防护、网络监控、MDM、
+网络代理、应用管控和客户端任务。支持 Apple Silicon 和 Intel Mac。
 
-App 同时提供标准主窗口和可选菜单栏入口。主窗口包含控制、信息、设置和关于页面；
-可以设置登录时启动控制 App，以及是否显示菜单栏图标。
+App 同时提供标准主窗口和可选菜单栏入口。主控制页只保留整套状态、服务数量以及开始、停止、刷新三个按钮；
+逐项 PID、属性和恢复条件放在组件与信息页。可以设置登录时启动控制 App，以及是否显示菜单栏图标。
 
-## “停止”到底会停止什么
+## 两种停止方式
 
-“停止”会干净停止 `com.volcengine.corplink.service` 连接主服务：先通过飞连自带 CLI 主动断开
+“停止连接服务”会干净停止 `com.volcengine.corplink.service`：先通过飞连自带 CLI 主动断开
 VPN/SWG，再从 launchd system domain 卸载主服务，确认无主进程残留并观察 5 秒防止复活，最后恢复
 plist 原有的不可变属性。
 
-它**不是卸载或完全关闭整个飞连**。EDR、AV、EDLP、MDM、应用管控、网络监控等独立安全与合规组件
-仍可能继续运行，App 的“信息”页会单独列出这些组件。这样做是刻意的：其中
-`com.corplink.networkmonitor` 设置了 `LaunchOnlyOnce=true`，macOS 系统手册说明这类任务不能保证在不重启
-机器的情况下安全恢复。
+“停止整套”会先保存停止前运行快照，再逐项卸载 8 个已知 launchd 任务、清理对应孤立进程、恢复
+`schg/uchg`，并观察 5 秒。只有任务、进程和已知活跃 System Extension 都不存在时才显示“整套已干净停止”。
+它不会删除飞连文件，因此不是卸载。
+
+“恢复停止前状态”只恢复快照中原先运行的组件，不会擅自启用组织策略已禁用的 MDM。需要特别注意：
+`com.corplink.networkmonitor` 设置了 `LaunchOnlyOnce=true`，停止后必须重启 Mac 才能可靠恢复；界面会明确
+显示“需要重启”，不会伪装成可以热启动。
 
 完整的原理、组件清单、验证标准和已知边界见
 [停止语义、原理与验证](docs/STOPPING.md)。也可以运行只读审计：
