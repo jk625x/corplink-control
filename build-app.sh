@@ -15,6 +15,7 @@ BIN_DIR="$("${SWIFT_BUILD[@]}" --show-bin-path)"
 /bin/mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
 /bin/cp "$BIN_DIR/CorplinkControlApp" "$CONTENTS_DIR/MacOS/CorplinkControlApp"
 /bin/cp "$BIN_DIR/CorplinkRootHelper" "$CONTENTS_DIR/Resources/corplink-root-helper"
+/bin/cp "$PROJECT_DIR/Resources/AppIcon.icns" "$CONTENTS_DIR/Resources/AppIcon.icns"
 /bin/cp "$PROJECT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
 /bin/chmod 755 "$CONTENTS_DIR/MacOS/CorplinkControlApp" "$CONTENTS_DIR/Resources/corplink-root-helper"
 

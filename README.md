@@ -1,5 +1,7 @@
 # Corplink Control
 
+<img src="assets/CorplinkControlIcon-v6-snow-miku-fullbleed.png" alt="Corplink Control snow-themed app icon" width="144">
+
 Corplink Control is a native macOS app for inspecting, starting, and cleanly stopping the complete Corplink runtime. It covers the connection service, system protection, Network Monitor, MDM, policy forwarding, network agent, application control, and client login task. Universal builds support both Apple Silicon and Intel Macs.
 
 The app opens in English by default and can be switched to Simplified Chinese in Settings.
@@ -15,6 +17,7 @@ The app opens in English by default and can be switched to Simplified Chinese in
 - A compact main window with live service and process counts.
 - Detailed component state, PIDs, plist flags, disabled-policy state, and recovery information on secondary pages.
 - Optional menu bar icon for quick access.
+- A snow-themed anime app icon and a lightweight snowflake menu bar indicator with distinct running, stopped, checking, and inconsistent states.
 - A setting that decides whether closing the main window keeps the app running in the background or quits the entire app.
 - Optional launch at login.
 - English and Simplified Chinese interfaces; English is the default.

@@ -1163,11 +1163,93 @@ private struct MenuBarView: View {
   }
 }
 
+private enum SnowMikuMenuBarState {
+  case checking, running, stopped, inconsistent
+}
+
+private enum SnowMikuMenuBarIcon {
+  static func image(state: SnowMikuMenuBarState) -> NSImage {
+    let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
+      NSColor.black.setStroke()
+      NSColor.black.setFill()
+
+      let snowflake = NSBezierPath()
+      snowflake.move(to: NSPoint(x: 8.3, y: 2.0))
+      snowflake.line(to: NSPoint(x: 8.3, y: 14.5))
+      snowflake.move(to: NSPoint(x: 3.0, y: 5.2))
+      snowflake.line(to: NSPoint(x: 13.6, y: 11.3))
+      snowflake.move(to: NSPoint(x: 13.6, y: 5.2))
+      snowflake.line(to: NSPoint(x: 3.0, y: 11.3))
+
+      snowflake.move(to: NSPoint(x: 8.3, y: 4.4))
+      snowflake.line(to: NSPoint(x: 6.8, y: 3.5))
+      snowflake.move(to: NSPoint(x: 8.3, y: 4.4))
+      snowflake.line(to: NSPoint(x: 9.8, y: 3.5))
+      snowflake.move(to: NSPoint(x: 8.3, y: 12.1))
+      snowflake.line(to: NSPoint(x: 6.8, y: 13.0))
+      snowflake.move(to: NSPoint(x: 8.3, y: 12.1))
+      snowflake.line(to: NSPoint(x: 9.8, y: 13.0))
+
+      snowflake.move(to: NSPoint(x: 5.0, y: 6.4))
+      snowflake.line(to: NSPoint(x: 4.0, y: 4.7))
+      snowflake.move(to: NSPoint(x: 5.0, y: 6.4))
+      snowflake.line(to: NSPoint(x: 3.9, y: 7.0))
+      snowflake.move(to: NSPoint(x: 11.6, y: 10.1))
+      snowflake.line(to: NSPoint(x: 12.6, y: 9.5))
+      snowflake.move(to: NSPoint(x: 11.6, y: 10.1))
+      snowflake.line(to: NSPoint(x: 12.6, y: 11.9))
+
+      snowflake.move(to: NSPoint(x: 11.6, y: 6.4))
+      snowflake.line(to: NSPoint(x: 12.6, y: 4.7))
+      snowflake.move(to: NSPoint(x: 11.6, y: 6.4))
+      snowflake.line(to: NSPoint(x: 12.6, y: 7.0))
+      snowflake.move(to: NSPoint(x: 5.0, y: 10.1))
+      snowflake.line(to: NSPoint(x: 4.0, y: 9.5))
+      snowflake.move(to: NSPoint(x: 5.0, y: 10.1))
+      snowflake.line(to: NSPoint(x: 4.0, y: 11.9))
+      snowflake.lineWidth = 1.35
+      snowflake.lineCapStyle = .round
+      snowflake.lineJoinStyle = .round
+      snowflake.stroke()
+
+      let statusDot = NSBezierPath(ovalIn: NSRect(x: 14.0, y: 13.6, width: 2.6, height: 2.6))
+      statusDot.lineWidth = 1.05
+      switch state {
+      case .running:
+        statusDot.fill()
+      case .stopped:
+        statusDot.stroke()
+      case .checking:
+        statusDot.setLineDash([1.4, 1.0], count: 2, phase: 0)
+        statusDot.stroke()
+      case .inconsistent:
+        statusDot.stroke()
+        let mark = NSBezierPath()
+        mark.move(to: NSPoint(x: 14.5, y: 14.1))
+        mark.line(to: NSPoint(x: 16.1, y: 15.7))
+        mark.lineWidth = 0.9
+        mark.lineCapStyle = .round
+        mark.stroke()
+      }
+      return true
+    }
+    image.isTemplate = true
+    return image
+  }
+}
+
 @main
 private struct CorplinkControlApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
   @StateObject private var controller = ServiceController()
   @AppStorage("showMenuBarItem") private var showMenuBarItem = true
+
+  private var snowMikuMenuBarState: SnowMikuMenuBarState {
+    if !controller.hasStatus { return .checking }
+    if controller.suiteClean { return .stopped }
+    if controller.suiteLoaded > 0 { return .running }
+    return .inconsistent
+  }
 
   var body: some Scene {
     Window("Corplink Control", id: "main") {
@@ -1175,10 +1257,11 @@ private struct CorplinkControlApp: App {
     }
     .defaultSize(width: 760, height: 520)
 
-    MenuBarExtra(
-      "Corplink Control", systemImage: controller.suiteSymbol, isInserted: $showMenuBarItem
-    ) {
+    MenuBarExtra(isInserted: $showMenuBarItem) {
       MenuBarView(controller: controller)
+    } label: {
+      Image(nsImage: SnowMikuMenuBarIcon.image(state: snowMikuMenuBarState))
+        .accessibilityLabel("Corplink Control")
     }
     .menuBarExtraStyle(.window)
 
