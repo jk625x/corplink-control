@@ -156,7 +156,6 @@ private final class ServiceController: ObservableObject {
   @Published var state: ServiceState = .loading
   @Published var flags: [String] = []
   @Published var isBusy = false
-  @Published var isRefreshing = false
   @Published var message: String?
   @Published var isError = false
   @Published var vpnStatus = "检查中"
@@ -171,6 +170,9 @@ private final class ServiceController: ObservableObject {
   @Published var auxiliaryComponents: [String] = []
   @Published var auxiliaryPIDs: [Int32] = []
   @Published var hasStatus = false
+
+  private var isFetchingStatus = false
+  private var statusRequestID = 0
 
   var suiteTitle: String {
     if !hasStatus { return "正在检查整套飞连…" }
@@ -198,7 +200,7 @@ private final class ServiceController: ObservableObject {
     return .orange
   }
 
-  var isWorking: Bool { isBusy || isRefreshing }
+  var isWorking: Bool { isBusy }
 
   var canRestoreWithoutRestart: Bool {
     restorePending.contains { $0 != "network-monitor" }
@@ -209,22 +211,29 @@ private final class ServiceController: ObservableObject {
   }
 
   func refresh() {
-    guard !isWorking, let helperURL else {
+    guard !isBusy, !isFetchingStatus, let helperURL else {
       if helperURL == nil {
         showMessage("App 内缺少控制 helper，请重新构建。", error: true)
       }
       return
     }
-    isRefreshing = true
+    isFetchingStatus = true
+    statusRequestID += 1
+    let requestID = statusRequestID
     Task {
       let result = await Self.run(helperURL, arguments: ["status"])
-      applyStatus(result)
-      isRefreshing = false
+      guard requestID == statusRequestID else { return }
+      if !isBusy {
+        applyStatus(result)
+      }
+      isFetchingStatus = false
     }
   }
 
   func perform(_ action: String) {
-    guard !isWorking, let helperURL else { return }
+    guard !isBusy, let helperURL else { return }
+    statusRequestID += 1
+    isFetchingStatus = false
     isBusy = true
     message = nil
     Task {
@@ -438,8 +447,15 @@ private final class LaunchAtLoginController: ObservableObject {
 
 private struct MainWindowView: View {
   @ObservedObject var controller: ServiceController
+  @Environment(\.scenePhase) private var scenePhase
   @State private var selection: SidebarItem? = .control
-  private let refreshTimer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+
+  private var mainWindowIsVisible: Bool {
+    NSApp.isActive
+      && NSApp.windows.contains { window in
+        window.isVisible && !window.isMiniaturized && window.title == "飞连控制"
+      }
+  }
 
   var body: some View {
     NavigationSplitView {
@@ -467,8 +483,22 @@ private struct MainWindowView: View {
       .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
     .frame(minWidth: 680, minHeight: 460)
-    .onAppear { controller.refresh() }
-    .onReceive(refreshTimer) { _ in controller.refresh() }
+    .task(id: scenePhase) {
+      guard scenePhase == .active else { return }
+      if mainWindowIsVisible {
+        controller.refresh()
+      }
+      while !Task.isCancelled {
+        do {
+          try await Task.sleep(nanoseconds: 30_000_000_000)
+        } catch {
+          return
+        }
+        if mainWindowIsVisible {
+          controller.refresh()
+        }
+      }
+    }
   }
 }
 
@@ -505,7 +535,7 @@ private struct StatusCard: View {
           .foregroundStyle(.secondary)
       }
       Spacer()
-      if controller.isWorking { ProgressView() }
+      if controller.isBusy { ProgressView() }
     }
     .padding(18)
     .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 16))
@@ -640,7 +670,7 @@ private struct ComponentsView: View {
           }
           .disabled(controller.isWorking)
           Spacer()
-          Text("状态每 5 秒自动刷新")
+          Text("主窗口位于前台时，每 30 秒静默刷新")
             .font(.caption)
             .foregroundStyle(.secondary)
         }

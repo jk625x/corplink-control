@@ -1,6 +1,6 @@
 cask "corplink-control" do
-  version "1.3.0"
-  sha256 "60e833b9134b12960e9e4cf57b12bbc4773a64ffcde5137c36200c31fff51060"
+  version "1.3.1"
+  sha256 "f7147929faef003ca4ec76fa029271fff348387f3f5bc79873c55b42499ff9af"
 
   url "https://github.com/jk625x/corplink-control/releases/download/v#{version}/CorplinkControl-#{version}.zip"
   name "飞连控制"
