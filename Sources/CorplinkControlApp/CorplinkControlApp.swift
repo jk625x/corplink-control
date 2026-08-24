@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import CorplinkControlCore
 import ServiceManagement
 import SwiftUI
 
@@ -206,17 +207,22 @@ private final class ServiceController: ObservableObject {
   @Published var isBusy = false
   @Published var message: String?
   @Published var isError = false
+  @Published var isWarning = false
   @Published var vpnStatus = "unknown"
   @Published var swgStatus = "unknown"
   @Published var components = ComponentStatus.definitions
   @Published var activeSystemExtensions: [String] = []
   @Published var suiteClean = false
+  @Published var suiteRuntimeStopped = false
   @Published var suiteLoaded = 0
   @Published var suiteTotal = ComponentStatus.definitions.count
+  @Published var suiteKnownTotal = ComponentStatus.definitions.count
   @Published var suiteProcesses = 0
   @Published var restorePending: [String] = []
   @Published var auxiliaryComponents: [String] = []
   @Published var auxiliaryPIDs: [Int32] = []
+  @Published var clientAppPresent = false
+  @Published var clientAppRunning = false
   @Published var hasStatus = false
 
   private var isFetchingStatus = false
@@ -232,12 +238,21 @@ private final class ServiceController: ObservableObject {
   var suiteTitle: String {
     if !hasStatus { return text(language, "Checking the complete Corplink suite…", "正在检查整套飞连…") }
     if suiteClean { return text(language, "Corplink is stopped", "飞连已停止") }
+    if suiteRuntimeStopped {
+      return text(language, "Corplink runtime is stopped", "飞连运行组件已停止")
+    }
     if suiteLoaded == 0 { return text(language, "Corplink state is inconsistent", "飞连状态异常") }
     return text(language, "Corplink is running", "飞连运行中")
   }
 
   var suiteDetail: String {
     if !hasStatus { return "" }
+    if suiteRuntimeStopped, !activeSystemExtensions.isEmpty {
+      return text(
+        language,
+        "No jobs or processes running · \(activeSystemExtensions.count) System Extension enabled",
+        "无任务或进程运行 · \(activeSystemExtensions.count) 个 System Extension 仍启用")
+    }
     return text(
       language,
       "\(suiteLoaded) / \(suiteTotal) services loaded · \(suiteProcesses) processes",
@@ -247,6 +262,7 @@ private final class ServiceController: ObservableObject {
   var suiteSymbol: String {
     if !hasStatus { return "arrow.clockwise" }
     if suiteClean { return "shield.slash" }
+    if suiteRuntimeStopped { return "exclamationmark.shield.fill" }
     if suiteLoaded > 0 { return "checkmark.shield.fill" }
     return "exclamationmark.shield.fill"
   }
@@ -254,6 +270,7 @@ private final class ServiceController: ObservableObject {
   var suiteColor: Color {
     if !hasStatus { return .secondary }
     if suiteClean { return .secondary }
+    if suiteRuntimeStopped { return .orange }
     if suiteLoaded > 0 { return .green }
     return .orange
   }
@@ -262,6 +279,7 @@ private final class ServiceController: ObservableObject {
 
   var canStartSuite: Bool {
     components.contains { !$0.loaded && $0.present && !$0.disabled }
+      || (clientAppPresent && !clientAppRunning)
   }
 
   private var helperURL: URL? {
@@ -298,6 +316,7 @@ private final class ServiceController: ObservableObject {
     isFetchingStatus = false
     isBusy = true
     message = nil
+    isWarning = false
     Task {
       let shouldDisconnect =
         action == "stop" || action == "stop-suite"
@@ -309,12 +328,15 @@ private final class ServiceController: ObservableObject {
         helperURL, action: action, language: currentLanguage)
       if result.status == 0 {
         let outputText = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let warning = outputText.split(separator: "\n").contains { line in
+          line.hasPrefix("Warning:") || line.hasPrefix("提示：")
+        }
         let parts = [
           disconnectSummary,
           outputText.isEmpty
             ? text(currentLanguage, "Operation completed successfully", "操作成功") : outputText,
         ].compactMap { $0 }
-        showMessage(parts.joined(separator: "\n"), error: false)
+        showMessage(parts.joined(separator: "\n"), error: false, warning: warning)
       } else {
         let detail = (result.stderr.isEmpty ? result.stdout : result.stderr)
           .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -322,7 +344,9 @@ private final class ServiceController: ObservableObject {
         showMessage(
           cancelled
             ? text(currentLanguage, "Administrator authorization was cancelled", "已取消管理员授权")
-            : (detail.isEmpty ? text(currentLanguage, "Operation failed", "操作失败") : detail),
+            : (detail.isEmpty
+              ? text(currentLanguage, "Operation failed", "操作失败")
+              : cleanAdministratorError(detail)),
           error: true)
       }
       let statusResult = await Self.run(
@@ -360,8 +384,10 @@ private final class ServiceController: ObservableObject {
     vpnStatus = values["vpn"] ?? "unknown"
     swgStatus = values["swg"] ?? "unknown"
     suiteClean = values["suite_clean"] == "true"
+    suiteRuntimeStopped = values["suite_runtime_stopped"] == "true"
     suiteLoaded = Int(values["suite_loaded"] ?? "") ?? 0
     suiteTotal = Int(values["suite_total"] ?? "") ?? ComponentStatus.definitions.count
+    suiteKnownTotal = Int(values["suite_known_total"] ?? "") ?? ComponentStatus.definitions.count
     suiteProcesses = Int(values["suite_processes"] ?? "") ?? 0
     restorePending = (values["restore_pending"] ?? "").split(separator: ",").map(String.init)
     auxiliaryComponents = (values["auxiliary_components"] ?? "").split(separator: ",").map(
@@ -369,6 +395,8 @@ private final class ServiceController: ObservableObject {
     auxiliaryPIDs = (values["auxiliary_pids"] ?? "").split(separator: ",").compactMap { Int32($0) }
     activeSystemExtensions = (values["system_extensions"] ?? "").split(separator: ",").map(
       String.init)
+    clientAppPresent = values["client_app_present"] == "true"
+    clientAppRunning = values["client_app_running"] == "true"
     hasStatus = true
 
     if loaded, !pids.isEmpty {
@@ -380,9 +408,10 @@ private final class ServiceController: ObservableObject {
     }
   }
 
-  private func showMessage(_ text: String, error: Bool) {
+  private func showMessage(_ text: String, error: Bool, warning: Bool = false) {
     message = text
     isError = error
+    isWarning = warning
   }
 
   func connectionStatusText(_ value: String) -> String {
@@ -722,7 +751,7 @@ private struct ControlView: View {
         }
         .buttonStyle(.bordered)
         .controlSize(.large)
-        .disabled(controller.isWorking || controller.suiteClean)
+        .disabled(controller.isWorking || controller.suiteRuntimeStopped)
 
         Button {
           controller.refresh()
@@ -737,10 +766,15 @@ private struct ControlView: View {
 
       if let message = controller.message {
         Label(
-          message, systemImage: controller.isError ? "xmark.circle.fill" : "checkmark.circle.fill"
+          message,
+          systemImage: controller.isError
+            ? "xmark.circle.fill"
+            : (controller.isWarning ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
         )
         .font(.callout)
-        .foregroundStyle(controller.isError ? .red : .secondary)
+        .foregroundStyle(
+          controller.isError ? Color.red : (controller.isWarning ? Color.orange : Color.secondary)
+        )
         .textSelection(.enabled)
       }
 
@@ -898,10 +932,17 @@ private struct InformationView: View {
               label: text(controller.language, "Suite status", "整套状态"),
               value: controller.suiteClean
                 ? text(controller.language, "Cleanly stopped", "已干净停止")
-                : text(controller.language, "Components are running", "有组件运行"))
+                : (controller.suiteRuntimeStopped
+                  ? text(
+                    controller.language, "Runtime stopped; System Extension enabled",
+                    "运行组件已停止；System Extension 仍启用")
+                  : text(controller.language, "Components are running", "有组件运行")))
             InfoRow(
-              label: text(controller.language, "Loaded jobs", "加载任务"),
+              label: text(controller.language, "Installed jobs loaded", "已安装任务加载数"),
               value: "\(controller.suiteLoaded) / \(controller.suiteTotal)")
+            InfoRow(
+              label: text(controller.language, "Known job definitions", "已知任务定义"),
+              value: String(controller.suiteKnownTotal))
             InfoRow(
               label: text(controller.language, "Related processes", "相关进程"),
               value: String(controller.suiteProcesses))
@@ -944,8 +985,8 @@ private struct InformationView: View {
           Text(
             text(
               controller.language,
-              "Stop removes and verifies each component. Start launches every installed component not disabled by policy, regardless of its previous state. Network Monitor is re-registered with the original Corplink plist; restart the Mac if verification fails. Active system extensions are not uninstalled and prevent a clean-stop result while active.",
-              "停止整套会逐项卸载并验证；开始整套会启动所有已安装且未被组织策略禁用的组件，不参考停止前状态。网络监控使用飞连原始 plist 重新注册，失败时需重启 Mac。活跃 System Extension 不会被卸载，若仍存在就不会报告为干净停止。")
+              "Stop removes and verifies installed jobs and related processes. Start skips absent legacy jobs and launches an installed CorpLink or SealSuite client app when no legacy client LaunchAgent exists. Network Monitor is re-registered with the original Corplink plist. Active system extensions are not uninstalled and are reported as a warning after the runtime stops.",
+              "停止整套会逐项卸载并验证已安装任务和相关进程；开始整套会跳过不存在的旧版任务。没有旧版客户端 LaunchAgent 时，将启动已安装的 CorpLink 或 SealSuite 客户端 App。网络监控使用飞连原始 plist 重新注册。活跃 System Extension 不会被卸载，运行组件停止后会作为提示展示。")
           )
           .font(.caption)
           .foregroundStyle(.secondary)
@@ -1246,7 +1287,7 @@ private struct CorplinkControlApp: App {
 
   private var snowMikuMenuBarState: SnowMikuMenuBarState {
     if !controller.hasStatus { return .checking }
-    if controller.suiteClean { return .stopped }
+    if controller.suiteRuntimeStopped { return .stopped }
     if controller.suiteLoaded > 0 { return .running }
     return .inconsistent
   }

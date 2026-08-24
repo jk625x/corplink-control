@@ -1,3 +1,4 @@
+import CorplinkControlCore
 import Darwin
 import Foundation
 
@@ -91,6 +92,16 @@ private let auxiliaryProcessPatterns: [(englishName: String, chineseName: String
   ),
   ("SealSuite Client", "SealSuite 客户端", "^/Applications/SealSuite\\.app/Contents/MacOS/SealSuite([[:space:]]|$)"),
 ]
+private let clientApplications: [(name: String, path: String, processPattern: String)] = [
+  (
+    "CorpLink", "/Applications/CorpLink.app",
+    "^/Applications/CorpLink\\.app/Contents/MacOS/CorpLink([[:space:]]|$)"
+  ),
+  (
+    "SealSuite", "/Applications/SealSuite.app",
+    "^/Applications/SealSuite\\.app/Contents/MacOS/SealSuite([[:space:]]|$)"
+  ),
+]
 
 private struct RestoreSnapshot: Codable {
   var createdAt: Date
@@ -130,10 +141,14 @@ private func consoleUID() -> uid_t {
   return uid_t(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) ?? getuid()
 }
 
+private func username(for uid: uid_t) -> String? {
+  let users = run("/usr/bin/dscl", [".", "-search", "/Users", "UniqueID", String(uid)])
+  return users.stdout.split(whereSeparator: { $0.isWhitespace }).first.map(String.init)
+}
+
 private func expandedPlistPath(for job: ManagedJob, uid: uid_t) -> String {
   guard job.plistPath.hasPrefix("~/") else { return job.plistPath }
-  let users = run("/usr/bin/dscl", [".", "-search", "/Users", "UniqueID", String(uid)])
-  guard let username = users.stdout.split(whereSeparator: { $0.isWhitespace }).first else {
+  guard let username = username(for: uid) else {
     return job.plistPath
   }
   let homeResult = run("/usr/bin/dscl", [".", "-read", "/Users/\(username)", "NFSHomeDirectory"])
@@ -148,9 +163,60 @@ private func isLoaded(_ job: ManagedJob, uid: uid_t) -> Bool {
 }
 
 private func processPIDs(_ job: ManagedJob) -> [Int32] {
-  let result = run("/usr/bin/pgrep", ["-f", job.processPattern])
+  matchingPIDs(job.processPattern)
+}
+
+private func matchingPIDs(_ pattern: String) -> [Int32] {
+  let result = run("/usr/bin/pgrep", ["-f", pattern])
   guard result.status == 0 else { return [] }
   return result.stdout.split(whereSeparator: { $0.isWhitespace }).compactMap { Int32($0) }.sorted()
+}
+
+private func clientApplicationPIDs() -> [Int32] {
+  Array(Set(clientApplications.flatMap { matchingPIDs($0.processPattern) })).sorted()
+}
+
+private func installedClientApplication() -> (name: String, path: String, processPattern: String)? {
+  clientApplications.first { FileManager.default.fileExists(atPath: $0.path) }
+}
+
+private enum ClientApplicationStartResult {
+  case notInstalled
+  case alreadyRunning
+  case started(String)
+  case failed(String)
+}
+
+private func startClientApplicationIfAvailable(uid: uid_t) -> ClientApplicationStartResult {
+  if !clientApplicationPIDs().isEmpty { return .alreadyRunning }
+  guard let application = installedClientApplication() else { return .notInstalled }
+  guard let username = username(for: uid) else {
+    return .failed(
+      message(
+        "Client application: could not determine the console user",
+        "客户端 App：无法确定当前登录用户"))
+  }
+  let result = run(
+    "/bin/launchctl",
+    [
+      "asuser", String(uid), "/usr/bin/sudo", "-u", username, "/usr/bin/open", "-g", "-j",
+      application.path,
+    ])
+  guard result.status == 0 else {
+    return .failed(
+      message(
+        "\(application.name) client failed to launch: \(result.stderr)",
+        "\(application.name) 客户端启动失败：\(result.stderr)"))
+  }
+  let deadline = Date().addingTimeInterval(8)
+  while Date() < deadline {
+    if !matchingPIDs(application.processPattern).isEmpty { return .started(application.name) }
+    Thread.sleep(forTimeInterval: 0.25)
+  }
+  return .failed(
+    message(
+      "\(application.name) client launch verification failed",
+      "\(application.name) 客户端启动后验证失败"))
 }
 
 private func plistFlags(path: String) -> Set<String> {
@@ -228,9 +294,7 @@ private func auxiliaryProcesses() -> (names: [String], pids: [Int32]) {
   for item in auxiliaryProcessPatterns {
     let name = message(item.englishName, item.chineseName)
     let pattern = item.pattern
-    let result = run("/usr/bin/pgrep", ["-f", pattern])
-    guard result.status == 0 else { continue }
-    let matches = result.stdout.split(whereSeparator: { $0.isWhitespace }).compactMap { Int32($0) }
+    let matches = matchingPIDs(pattern)
     if !matches.isEmpty { names.append(name) }
     pids.formUnion(matches)
   }
@@ -541,12 +605,6 @@ private func stopSuite() -> Int32 {
         "仍有辅助进程：\(auxiliaryResidues.names.joined(separator: "、"))"))
   }
   let extensions = activeRelatedSystemExtensions()
-  if !extensions.isEmpty {
-    errors.append(
-      message(
-        "Active System Extensions remain: \(extensions.joined(separator: ", ")); they were not uninstalled so the operation remains reversible",
-        "仍有活跃 System Extension：\(extensions.joined(separator: ", "))；为保持可恢复性未执行卸载"))
-  }
   guard errors.isEmpty else {
     fputs(errors.joined(separator: "\n") + "\n", stderr)
     return 1
@@ -558,6 +616,12 @@ private func stopSuite() -> Int32 {
     message(
       "The complete Corplink suite has stopped. No known job or process returned during the five-second observation\(monitorNote).",
       "整套飞连运行组件已停止；持续观察 5 秒未复活，无已知任务或进程残留\(monitorNote)。"))
+  if !extensions.isEmpty {
+    print(
+      message(
+        "Warning: System Extensions remain enabled: \(extensions.joined(separator: ", ")). They were not uninstalled so the stop remains reversible.",
+        "提示：System Extension 仍处于启用状态：\(extensions.joined(separator: ", "))。为保持停止操作可恢复，未执行卸载。"))
+  }
   return 0
 }
 
@@ -570,13 +634,41 @@ private func startSuite() -> Int32 {
   ]
   var errors: [String] = []
   var skipped: [String] = []
+  var notes: [String] = []
+  let snapshot = readSnapshot()
+  var clientLaunchJobInstalled = false
   for id in startOrder {
     guard let job = jobs.first(where: { $0.id == id }) else { continue }
+    let path = expandedPlistPath(for: job, uid: uid)
+    let facts = ComponentFacts(
+      plistPresent: FileManager.default.fileExists(atPath: path),
+      loaded: isLoaded(job, uid: uid),
+      processCount: processPIDs(job).count,
+      pendingRestore: snapshot?.pendingJobIDs.contains(job.id) == true)
+    let installed = job.id == "client" ? facts.hasLaunchJobEvidence : facts.isInstalled
+    if job.id == "client" { clientLaunchJobInstalled = installed }
+    guard installed else {
+      skipped.append(message("\(job.name) (not installed)", "\(job.name)（未安装）"))
+      continue
+    }
     if isDisabled(job, uid: uid) {
       skipped.append(message("\(job.name) (disabled by policy)", "\(job.name)（策略禁用）"))
       continue
     }
     if let error = startJob(job, uid: uid) { errors.append(error) }
+  }
+  if !clientLaunchJobInstalled {
+    switch startClientApplicationIfAvailable(uid: uid) {
+    case .notInstalled, .alreadyRunning:
+      break
+    case .started(let name):
+      notes.append(
+        message(
+          "\(name) client was launched without a legacy LaunchAgent",
+          "已启动 \(name) 客户端；此安装未使用旧版 LaunchAgent"))
+    case .failed(let error):
+      errors.append(error)
+    }
   }
   guard errors.isEmpty else {
     fputs(errors.joined(separator: "\n") + "\n", stderr)
@@ -589,6 +681,7 @@ private func startSuite() -> Int32 {
     message(
       "All installed Corplink components not disabled by policy started and passed verification\(skippedNote).",
       "所有已安装且未被策略禁用的飞连组件均已启动并通过验证\(skippedNote)。"))
+  for note in notes { print(note) }
   return 0
 }
 
@@ -628,6 +721,7 @@ private func printStatus() -> Int32 {
   let extensions = activeRelatedSystemExtensions()
   let auxiliary = auxiliaryProcesses()
   var loadedCount = 0
+  var installedCount = 0
   var processCount = 0
   var inconsistent = false
   for job in jobs {
@@ -638,21 +732,32 @@ private func printStatus() -> Int32 {
     let disabled = isDisabled(job, uid: uid)
     let pending = snapshot?.pendingJobIDs.contains(job.id) == true
     let restartRequired = job.launchOnlyOnce && pending && !loaded
+    let facts = ComponentFacts(
+      plistPresent: FileManager.default.fileExists(atPath: path), loaded: loaded,
+      processCount: pids.count, pendingRestore: pending
+    )
+    let present = job.id == "client" ? facts.hasLaunchJobEvidence : facts.isInstalled
     if loaded { loadedCount += 1 }
+    if present { installedCount += 1 }
     processCount += pids.count
     if loaded != (!pids.isEmpty), job.expectsResidentProcess { inconsistent = true }
     let fields = [
       loaded ? "1" : "0", pids.map(String.init).joined(separator: ":"),
       flags.joined(separator: ":"), disabled ? "1" : "0", restartRequired ? "1" : "0",
-      FileManager.default.fileExists(atPath: path) ? "1" : "0",
+      present ? "1" : "0",
     ]
     print("job.\(job.id)=\(fields.joined(separator: "|"))")
   }
   processCount += auxiliary.pids.count
-  let clean = loadedCount == 0 && processCount == 0 && extensions.isEmpty
+  let runtimeState = SuiteRuntimeState.classify(
+    loadedJobs: loadedCount, processCount: processCount,
+    activeSystemExtensions: extensions.count)
+  let clean = runtimeState == .cleanlyStopped
   print("suite_clean=\(clean ? "true" : "false")")
+  print("suite_runtime_stopped=\(runtimeState.runtimeStopped ? "true" : "false")")
   print("suite_loaded=\(loadedCount)")
-  print("suite_total=\(jobs.count)")
+  print("suite_total=\(installedCount)")
+  print("suite_known_total=\(jobs.count)")
   print("suite_processes=\(processCount)")
   print("restore_pending=\(snapshot?.pendingJobIDs.sorted().joined(separator: ",") ?? "")")
   print("auxiliary_components=\(auxiliary.names.joined(separator: ","))")
@@ -660,6 +765,8 @@ private func printStatus() -> Int32 {
   print("vpn=\(connectionStatus("vpn"))")
   print("swg=\(connectionStatus("swg"))")
   print("system_extensions=\(extensions.joined(separator: ","))")
+  print("client_app_present=\(installedClientApplication() == nil ? "false" : "true")")
+  print("client_app_running=\(clientApplicationPIDs().isEmpty ? "false" : "true")")
   if clean { return 3 }
   if inconsistent { return 1 }
   return 0

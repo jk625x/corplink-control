@@ -10,8 +10,13 @@ let package = Package(
     .executable(name: "CorplinkRootHelper", targets: ["CorplinkRootHelper"]),
   ],
   targets: [
-    .executableTarget(name: "CorplinkControlApp"),
-    .executableTarget(name: "CorplinkRootHelper"),
+    .target(name: "CorplinkControlCore"),
+    .executableTarget(
+      name: "CorplinkControlApp", dependencies: ["CorplinkControlCore"]),
+    .executableTarget(
+      name: "CorplinkRootHelper", dependencies: ["CorplinkControlCore"]),
+    .testTarget(
+      name: "CorplinkControlCoreTests", dependencies: ["CorplinkControlCore"]),
   ],
   swiftLanguageModes: [.v5]
 )

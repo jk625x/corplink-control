@@ -4,11 +4,11 @@
 
 The main window has intentionally simple suite-wide semantics:
 
-- **Start** starts every installed Corplink component that is not disabled by macOS or organization policy. It does not use the pre-stop state as its scope.
+- **Start** starts every installed Corplink component that is not disabled by macOS or organization policy. Missing legacy jobs are skipped, and an installed CorpLink or SealSuite client app is launched when no legacy client LaunchAgent exists. It does not use the pre-stop state as its scope.
 - **Stop** stops every known Corplink launchd job and matching process without deleting the vendor's files.
 - The Components page provides individual controls and diagnostics when needed.
 
-The UI never describes a partial stop as a clean suite stop. On the Mac audited on 2026-08-23, macOS 26.6.2 with CorpLink 3.3.15 installed at least these independent jobs:
+The UI distinguishes a clean stop from a runtime stop that leaves a macOS System Extension enabled. On the Mac audited on 2026-08-23, macOS 26.6.2 with CorpLink 3.3.15 installed at least these independent jobs:
 
 | launchd label | Purpose or executable | Included in suite Stop |
 | --- | --- | --- |
@@ -39,15 +39,15 @@ The vendor's `/usr/local/corplink/uninstall.sh` removes extensions, jobs, and fi
 6. If a process remains after its job is unloaded, sends `SIGTERM`, waits two seconds, then uses `SIGKILL` only for a still-matching orphan.
 7. Temporarily removes only the `schg` or `uchg` flags actually present on a plist and restores the identical flag set after the operation.
 8. Observes the machine for five seconds. Any known job or process that returns makes the operation fail.
-9. Treats known active Corplink System Extensions as remaining runtime state. The app does not uninstall them because that would change a reversible stop into an uninstall.
+9. Reports known active Corplink System Extensions as a warning. The app does not uninstall them because that would change a reversible stop into an uninstall.
 
-A suite stop is reported as clean only when all eight known jobs are unloaded, their matching processes are absent, matching Finder Sync or SealSuite auxiliary processes are absent, and no known Corplink System Extension is active. Plists and application files remain because Stop is not Uninstall.
+A suite stop is reported as clean only when all installed known jobs are unloaded, their matching processes are absent, matching Finder Sync or SealSuite auxiliary processes are absent, and no known Corplink System Extension is active. If jobs and processes are gone but an extension remains enabled, the operation succeeds as a **runtime stop with a warning**. Plists, application files, and System Extensions remain because Stop is not Uninstall.
 
 ## What Start does
 
-Start processes all installed and non-disabled components in dependency order: system protection, Network Monitor, connection service, policy tasks, user agents, and client. It uses modern `launchctl bootstrap`; an already-loaded job can be restarted with `kickstart -k`. Jobs disabled by macOS or organization policy are skipped and are never force-enabled.
+Start processes all installed and non-disabled components in dependency order: system protection, Network Monitor, connection service, policy tasks, user agents, and client. A job counts as installed when its plist, loaded job, matching process, or pending recovery record exists; the legacy client LaunchAgent specifically requires plist, loaded-job, or recovery evidence because the client App is tracked separately. Missing legacy jobs are skipped and are not included in the installed-job total. It uses modern `launchctl bootstrap`; an already-loaded job can be restarted with `kickstart -k`. Jobs disabled by macOS or organization policy are skipped and are never force-enabled.
 
-Each resident job must be loaded and have a matching process before the helper reports success. Network Monitor is registered from its unchanged original plist. The CorpLink client may recreate its per-user LaunchAgent, so the helper preserves and restores the original plist bytes, ownership, and mode where necessary.
+Each resident job must be loaded and have a matching process before the helper reports success. Network Monitor is registered from its unchanged original plist. The CorpLink client may recreate its per-user LaunchAgent, so the helper preserves and restores the original plist bytes, ownership, and mode where necessary. On installations without that legacy LaunchAgent, Start launches an installed `/Applications/CorpLink.app` or `/Applications/SealSuite.app` in the console user's GUI session and verifies its process instead of fabricating a vendor plist.
 
 ## Status and audit rules
 

@@ -1,6 +1,6 @@
 cask "corplink-control" do
-  version "1.5.1"
-  sha256 "f6037da299055f0157502df76414dee292532bee91069809050e2899e5360e44"
+  version "1.5.2"
+  sha256 "0f8439ad0296d63cbd74db6481d2f59c465a1efed93e29066b00a0b13698a0d4"
 
   url "https://github.com/jk625x/corplink-control/releases/download/v#{version}/CorplinkControl-#{version}.zip"
   name "Corplink Control"
