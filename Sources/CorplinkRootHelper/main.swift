@@ -1,9 +1,13 @@
 import CorplinkControlCore
 import Darwin
+import Dispatch
 import Foundation
 
-private let usesChinese =
+private let environmentUsesChinese =
   ProcessInfo.processInfo.environment["CORPLINK_CONTROL_LANG"] == "zh-Hans"
+private var daemonUsesChinese: Bool?
+
+private var usesChinese: Bool { daemonUsesChinese ?? environmentUsesChinese }
 
 private func message(_ english: String, _ chinese: String) -> String {
   usesChinese ? chinese : english
@@ -134,6 +138,130 @@ private func run(_ executable: String, _ arguments: [String]) -> CommandResult {
     status: process.terminationStatus,
     stdout: String(decoding: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
     stderr: String(decoding: stderrPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+}
+
+private func currentExecutablePath() -> String {
+  var size = UInt32(PATH_MAX)
+  var buffer = [CChar](repeating: 0, count: Int(size))
+  if _NSGetExecutablePath(&buffer, &size) == 0 {
+    return String(cString: buffer)
+  }
+  buffer = [CChar](repeating: 0, count: Int(size))
+  if _NSGetExecutablePath(&buffer, &size) == 0 {
+    return String(cString: buffer)
+  }
+  return CommandLine.arguments[0]
+}
+
+private func containingApplicationURL() -> URL? {
+  var candidate = URL(fileURLWithPath: currentExecutablePath()).standardizedFileURL
+  while candidate.path != "/" {
+    if candidate.pathExtension == "app" { return candidate }
+    candidate.deleteLastPathComponent()
+  }
+  return nil
+}
+
+private func captureCommand(_ action: String, language: String) -> CommandResult {
+  let stdoutPipe = Pipe()
+  let stderrPipe = Pipe()
+  let savedStdout = dup(STDOUT_FILENO)
+  let savedStderr = dup(STDERR_FILENO)
+  guard savedStdout >= 0, savedStderr >= 0 else {
+    if savedStdout >= 0 { close(savedStdout) }
+    if savedStderr >= 0 { close(savedStderr) }
+    return CommandResult(status: 71, stdout: "", stderr: "Could not capture helper output.")
+  }
+
+  fflush(stdout)
+  fflush(stderr)
+  guard
+    dup2(stdoutPipe.fileHandleForWriting.fileDescriptor, STDOUT_FILENO) >= 0,
+    dup2(stderrPipe.fileHandleForWriting.fileDescriptor, STDERR_FILENO) >= 0
+  else {
+    _ = dup2(savedStdout, STDOUT_FILENO)
+    _ = dup2(savedStderr, STDERR_FILENO)
+    close(savedStdout)
+    close(savedStderr)
+    return CommandResult(status: 71, stdout: "", stderr: "Could not redirect helper output.")
+  }
+
+  daemonUsesChinese = language == "zh-Hans"
+  let status = executeCommand(action)
+  daemonUsesChinese = nil
+  fflush(stdout)
+  fflush(stderr)
+
+  _ = dup2(savedStdout, STDOUT_FILENO)
+  _ = dup2(savedStderr, STDERR_FILENO)
+  close(savedStdout)
+  close(savedStderr)
+  stdoutPipe.fileHandleForWriting.closeFile()
+  stderrPipe.fileHandleForWriting.closeFile()
+
+  return CommandResult(
+    status: status,
+    stdout: String(
+      decoding: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
+    stderr: String(
+      decoding: stderrPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+}
+
+private final class PrivilegedHelperService: NSObject, CorplinkPrivilegedHelperProtocol {
+  private static let operationQueue = DispatchQueue(
+    label: "local.sunyi.corplink-control.root-helper.operations")
+
+  func perform(
+    action: String,
+    language: String,
+    withReply reply: @escaping (NSNumber, String, String) -> Void
+  ) {
+    guard PrivilegedHelperConfiguration.allowedActions.contains(action) else {
+      reply(NSNumber(value: 64), "", "The privileged helper rejected an unknown action.")
+      return
+    }
+    guard geteuid() == 0 else {
+      reply(NSNumber(value: 77), "", "The privileged helper is not running as root.")
+      return
+    }
+    Self.operationQueue.async {
+      let result = captureCommand(action, language: language)
+      reply(NSNumber(value: result.status), result.stdout, result.stderr)
+    }
+  }
+}
+
+private final class PrivilegedHelperListenerDelegate: NSObject, NSXPCListenerDelegate {
+  func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection)
+    -> Bool
+  {
+    guard geteuid() == 0, connection.effectiveUserIdentifier == consoleUID() else { return false }
+    connection.exportedInterface = NSXPCInterface(with: CorplinkPrivilegedHelperProtocol.self)
+    connection.exportedObject = PrivilegedHelperService()
+    connection.activate()
+    return true
+  }
+}
+
+private func runPrivilegedDaemon() -> Never {
+  guard geteuid() == 0 else {
+    fputs("The privileged helper daemon must be launched by launchd as root.\n", stderr)
+    exit(77)
+  }
+  guard
+    let appURL = containingApplicationURL(),
+    Bundle(url: appURL)?.bundleIdentifier == PrivilegedHelperConfiguration.appBundleIdentifier,
+    let appRequirement = PrivilegedHelperConfiguration.designatedRequirement(at: appURL)
+  else {
+    fputs("The containing app does not have a valid designated requirement.\n", stderr)
+    exit(78)
+  }
+  let listener = NSXPCListener(machServiceName: PrivilegedHelperConfiguration.machServiceName)
+  let delegate = PrivilegedHelperListenerDelegate()
+  listener.delegate = delegate
+  listener.setConnectionCodeSigningRequirement(appRequirement)
+  listener.activate()
+  dispatchMain()
 }
 
 private func consoleUID() -> uid_t {
@@ -827,30 +955,35 @@ private func printHelp() {
   }
 }
 
+private func executeCommand(_ command: String) -> Int32 {
+  switch command {
+  case "help", "--help", "-h":
+    printHelp()
+    return 0
+  case "status": return printStatus()
+  case "start": return startComponent(id: "connection")
+  case "stop": return stopComponent(id: "connection")
+  case "stop-suite": return stopSuite()
+  case "start-suite": return startSuite()
+  case "restore-suite": return restoreSuite()
+  default:
+    break
+  }
+  if command.hasPrefix("stop-component:") {
+    return stopComponent(id: String(command.dropFirst("stop-component:".count)))
+  }
+  if command.hasPrefix("start-component:") {
+    return startComponent(id: String(command.dropFirst("start-component:".count)))
+  }
+  fputs(message("Unknown command: \(command)\n", "未知命令：\(command)\n"), stderr)
+  printHelp()
+  return 2
+}
+
 let arguments = Array(CommandLine.arguments.dropFirst())
+if arguments == ["--daemon"] { runPrivilegedDaemon() }
 guard arguments.count == 1 else {
   printHelp()
   exit(arguments.isEmpty ? 0 : 2)
 }
-let command = arguments[0]
-switch command {
-case "help", "--help", "-h":
-  printHelp()
-  exit(0)
-case "status": exit(printStatus())
-case "start": exit(startComponent(id: "connection"))
-case "stop": exit(stopComponent(id: "connection"))
-case "stop-suite": exit(stopSuite())
-case "start-suite": exit(startSuite())
-case "restore-suite": exit(restoreSuite())
-default:
-  if command.hasPrefix("stop-component:") {
-    exit(stopComponent(id: String(command.dropFirst("stop-component:".count))))
-  }
-  if command.hasPrefix("start-component:") {
-    exit(startComponent(id: String(command.dropFirst("start-component:".count))))
-  }
-  fputs(message("Unknown command: \(command)\n", "未知命令：\(command)\n"), stderr)
-  printHelp()
-  exit(2)
-}
+exit(executeCommand(arguments[0]))
