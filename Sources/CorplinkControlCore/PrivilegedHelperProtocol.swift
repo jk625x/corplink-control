@@ -2,12 +2,14 @@ import Foundation
 import Security
 
 public enum PrivilegedHelperConfiguration {
+  public static let protocolVersion = 2
+  public static let administratorGroupID: UInt32 = 80
   public static let daemonPlistName = "local.sunyi.corplink-control.root-helper.plist"
   public static let machServiceName = "local.sunyi.corplink-control.root-helper"
   public static let appBundleIdentifier = "local.sunyi.corplink-control"
   public static let helperIdentifier = "local.sunyi.corplink-control.root-helper"
 
-  private static let componentIDs = [
+  public static let componentIDs = [
     "connection", "protection", "network-monitor", "data-forwarder", "mdm",
     "network-agent", "app-blocker", "client",
   ]
@@ -20,6 +22,36 @@ public enum PrivilegedHelperConfiguration {
     }
     return actions
   }()
+
+  public static func isAdministratorMembershipResult(status: Int32, stdout: String) -> Bool {
+    status == 0
+      && stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        == "user is a member of the group"
+  }
+
+  public static func canFallbackAfterTransportFailure(requestSubmitted: Bool) -> Bool {
+    !requestSubmitted
+  }
+
+  public static func isCompatibleProbe(
+    protocolVersion: Int,
+    bundleVersion: String,
+    expectedBundleVersion: String
+  ) -> Bool {
+    protocolVersion == Self.protocolVersion
+      && !bundleVersion.isEmpty
+      && !expectedBundleVersion.isEmpty
+      && bundleVersion == bundleVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+      && expectedBundleVersion
+        == expectedBundleVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+      && bundleVersion == expectedBundleVersion
+  }
+
+  public static func registrationFingerprint(
+    bundleVersion: String, appRequirement: String, helperRequirement: String
+  ) -> String {
+    "\(bundleVersion)\n\(appRequirement)\n\(helperRequirement)"
+  }
 
   public static func designatedRequirement(at codeURL: URL) -> String? {
     var staticCode: SecStaticCode?
@@ -47,6 +79,8 @@ public enum PrivilegedHelperConfiguration {
 }
 
 @objc public protocol CorplinkPrivilegedHelperProtocol {
+  func probe(withReply reply: @escaping (NSNumber, String) -> Void)
+
   func perform(
     action: String,
     language: String,

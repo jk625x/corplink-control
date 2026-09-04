@@ -13,9 +13,9 @@ private func message(_ english: String, _ chinese: String) -> String {
   usesChinese ? chinese : english
 }
 
-private enum JobDomain { case system, gui }
+private enum JobDomain: Sendable { case system, gui }
 
-private struct ManagedJob {
+private struct ManagedJob: Sendable {
   let id: String
   let englishName: String
   let chineseName: String
@@ -95,6 +95,10 @@ private let auxiliaryProcessPatterns: [(englishName: String, chineseName: String
     "^/Applications/(CorpLink|SealSuite)\\.app/.+/CorpLink Finder Sync([[:space:]]|$)"
   ),
   ("SealSuite Client", "SealSuite 客户端", "^/Applications/SealSuite\\.app/Contents/MacOS/SealSuite([[:space:]]|$)"),
+  (
+    "Client Wi-Fi Helper", "客户端 Wi-Fi Helper",
+    "^/Applications/(CorpLink|SealSuite)\\.app/Contents/MacOS/wifihelper([[:space:]]|$)"
+  ),
 ]
 private let clientApplications: [(name: String, path: String, processPattern: String)] = [
   (
@@ -119,25 +123,91 @@ private struct CommandResult {
   let stderr: String
 }
 
+private struct InspectionFailure: Error {
+  let english: String
+  let chinese: String
+
+  var localizedMessage: String { message(english, chinese) }
+}
+
+private func commandFailure(
+  englishSubject: String, chineseSubject: String, result: CommandResult
+) -> InspectionFailure {
+  let rawDetail = result.stderr.isEmpty ? result.stdout : result.stderr
+  let detail = rawDetail.trimmingCharacters(in: .whitespacesAndNewlines)
+  let englishReason =
+    result.status == 124
+    ? "the command timed out"
+    : "the command exited with status \(result.status)"
+  let chineseReason = result.status == 124 ? "命令超时" : "命令退出状态为 \(result.status)"
+  let englishSuffix = detail.isEmpty ? "" : ": \(detail)"
+  let chineseSuffix = detail.isEmpty ? "" : "：\(detail)"
+  return InspectionFailure(
+    english: "Could not inspect \(englishSubject): \(englishReason)\(englishSuffix)",
+    chinese: "无法检查\(chineseSubject)：\(chineseReason)\(chineseSuffix)")
+}
+
+private func makeUnlinkedCaptureFile() -> FileHandle? {
+  var template = Array("/tmp/corplink-control-helper.XXXXXX".utf8CString)
+  let descriptor = mkstemp(&template)
+  guard descriptor >= 0 else { return nil }
+  _ = unlink(template)
+  return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+}
+
+private func readCaptureFile(_ file: FileHandle) -> String {
+  do {
+    try file.seek(toOffset: 0)
+    return String(decoding: try file.readToEnd() ?? Data(), as: UTF8.self)
+  } catch {
+    return ""
+  }
+}
+
 @discardableResult
-private func run(_ executable: String, _ arguments: [String]) -> CommandResult {
+private func run(
+  _ executable: String, _ arguments: [String], timeout: TimeInterval = 10
+) -> CommandResult {
   let process = Process()
-  let stdoutPipe = Pipe()
-  let stderrPipe = Pipe()
+  guard let stdoutFile = makeUnlinkedCaptureFile(), let stderrFile = makeUnlinkedCaptureFile()
+  else {
+    return CommandResult(
+      status: 71, stdout: "", stderr: "Could not create command output capture files.")
+  }
   process.executableURL = URL(fileURLWithPath: executable)
   process.arguments = arguments
-  process.standardOutput = stdoutPipe
-  process.standardError = stderrPipe
+  process.standardOutput = stdoutFile
+  process.standardError = stderrFile
   do {
     try process.run()
-    process.waitUntilExit()
   } catch {
     return CommandResult(status: 127, stdout: "", stderr: error.localizedDescription)
   }
+  let deadline = Date().addingTimeInterval(timeout)
+  while process.isRunning, Date() < deadline {
+    Thread.sleep(forTimeInterval: 0.05)
+  }
+  let timedOut = process.isRunning
+  if timedOut {
+    process.terminate()
+    let terminationDeadline = Date().addingTimeInterval(1)
+    while process.isRunning, Date() < terminationDeadline {
+      Thread.sleep(forTimeInterval: 0.05)
+    }
+    if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+  }
+  process.waitUntilExit()
+  let stdout = readCaptureFile(stdoutFile)
+  let stderr = readCaptureFile(stderrFile)
+  if timedOut {
+    return CommandResult(
+      status: 124, stdout: stdout,
+      stderr: stderr.isEmpty ? "The command timed out: \(executable)" : stderr)
+  }
   return CommandResult(
     status: process.terminationStatus,
-    stdout: String(decoding: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
-    stderr: String(decoding: stderrPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+    stdout: stdout,
+    stderr: stderr)
 }
 
 private func currentExecutablePath() -> String {
@@ -163,8 +233,10 @@ private func containingApplicationURL() -> URL? {
 }
 
 private func captureCommand(_ action: String, language: String) -> CommandResult {
-  let stdoutPipe = Pipe()
-  let stderrPipe = Pipe()
+  guard let stdoutFile = makeUnlinkedCaptureFile(), let stderrFile = makeUnlinkedCaptureFile()
+  else {
+    return CommandResult(status: 71, stdout: "", stderr: "Could not capture helper output.")
+  }
   let savedStdout = dup(STDOUT_FILENO)
   let savedStderr = dup(STDERR_FILENO)
   guard savedStdout >= 0, savedStderr >= 0 else {
@@ -176,8 +248,8 @@ private func captureCommand(_ action: String, language: String) -> CommandResult
   fflush(stdout)
   fflush(stderr)
   guard
-    dup2(stdoutPipe.fileHandleForWriting.fileDescriptor, STDOUT_FILENO) >= 0,
-    dup2(stderrPipe.fileHandleForWriting.fileDescriptor, STDERR_FILENO) >= 0
+    dup2(stdoutFile.fileDescriptor, STDOUT_FILENO) >= 0,
+    dup2(stderrFile.fileDescriptor, STDERR_FILENO) >= 0
   else {
     _ = dup2(savedStdout, STDOUT_FILENO)
     _ = dup2(savedStderr, STDERR_FILENO)
@@ -196,20 +268,32 @@ private func captureCommand(_ action: String, language: String) -> CommandResult
   _ = dup2(savedStderr, STDERR_FILENO)
   close(savedStdout)
   close(savedStderr)
-  stdoutPipe.fileHandleForWriting.closeFile()
-  stderrPipe.fileHandleForWriting.closeFile()
 
   return CommandResult(
     status: status,
-    stdout: String(
-      decoding: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
-    stderr: String(
-      decoding: stderrPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+    stdout: readCaptureFile(stdoutFile),
+    stderr: readCaptureFile(stderrFile))
 }
 
 private final class PrivilegedHelperService: NSObject, CorplinkPrivilegedHelperProtocol {
   private static let operationQueue = DispatchQueue(
     label: "local.sunyi.corplink-control.root-helper.operations")
+  private let bundleVersion: String
+
+  init(bundleVersion: String) {
+    self.bundleVersion = bundleVersion
+    super.init()
+  }
+
+  func probe(withReply reply: @escaping (NSNumber, String) -> Void) {
+    guard geteuid() == 0 else {
+      reply(NSNumber(value: 0), "")
+      return
+    }
+    reply(
+      NSNumber(value: PrivilegedHelperConfiguration.protocolVersion),
+      bundleVersion)
+  }
 
   func perform(
     action: String,
@@ -232,12 +316,24 @@ private final class PrivilegedHelperService: NSObject, CorplinkPrivilegedHelperP
 }
 
 private final class PrivilegedHelperListenerDelegate: NSObject, NSXPCListenerDelegate {
+  private let bundleVersion: String
+
+  init(bundleVersion: String) {
+    self.bundleVersion = bundleVersion
+    super.init()
+  }
+
   func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection)
     -> Bool
   {
-    guard geteuid() == 0, connection.effectiveUserIdentifier == consoleUID() else { return false }
+    let clientUID = connection.effectiveUserIdentifier
+    guard
+      geteuid() == 0,
+      clientUID == consoleUID(),
+      isAdministrator(uid: clientUID)
+    else { return false }
     connection.exportedInterface = NSXPCInterface(with: CorplinkPrivilegedHelperProtocol.self)
-    connection.exportedObject = PrivilegedHelperService()
+    connection.exportedObject = PrivilegedHelperService(bundleVersion: bundleVersion)
     connection.activate()
     return true
   }
@@ -250,14 +346,16 @@ private func runPrivilegedDaemon() -> Never {
   }
   guard
     let appURL = containingApplicationURL(),
-    Bundle(url: appURL)?.bundleIdentifier == PrivilegedHelperConfiguration.appBundleIdentifier,
+    let appBundle = Bundle(url: appURL),
+    appBundle.bundleIdentifier == PrivilegedHelperConfiguration.appBundleIdentifier,
+    let bundleVersion = appBundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
     let appRequirement = PrivilegedHelperConfiguration.designatedRequirement(at: appURL)
   else {
     fputs("The containing app does not have a valid designated requirement.\n", stderr)
     exit(78)
   }
   let listener = NSXPCListener(machServiceName: PrivilegedHelperConfiguration.machServiceName)
-  let delegate = PrivilegedHelperListenerDelegate()
+  let delegate = PrivilegedHelperListenerDelegate(bundleVersion: bundleVersion)
   listener.delegate = delegate
   listener.setConnectionCodeSigningRequirement(appRequirement)
   listener.activate()
@@ -265,43 +363,101 @@ private func runPrivilegedDaemon() -> Never {
 }
 
 private func consoleUID() -> uid_t {
-  let result = run("/usr/bin/stat", ["-f", "%u", "/dev/console"])
+  let result = run("/usr/bin/stat", ["-f", "%u", "/dev/console"], timeout: 2)
   return uid_t(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) ?? getuid()
 }
 
+private func isAdministrator(uid: uid_t) -> Bool {
+  if uid == 0 { return true }
+  let result = run(
+    "/usr/bin/dsmemberutil",
+    [
+      "checkmembership", "-u", String(uid), "-g",
+      String(PrivilegedHelperConfiguration.administratorGroupID),
+    ], timeout: 3)
+  return PrivilegedHelperConfiguration.isAdministratorMembershipResult(
+    status: result.status, stdout: result.stdout)
+}
+
+private struct UserRecord {
+  let name: String
+  let homeDirectory: String
+}
+
+private func userRecord(for uid: uid_t) -> UserRecord? {
+  var passwordEntry = passwd()
+  var result: UnsafeMutablePointer<passwd>?
+  let configuredSize = sysconf(_SC_GETPW_R_SIZE_MAX)
+  let bufferSize = configuredSize > 0 ? Int(configuredSize) : 16_384
+  var buffer = [CChar](repeating: 0, count: bufferSize)
+  guard
+    getpwuid_r(uid, &passwordEntry, &buffer, buffer.count, &result) == 0,
+    result != nil,
+    let namePointer = passwordEntry.pw_name,
+    let homePointer = passwordEntry.pw_dir
+  else { return nil }
+  return UserRecord(
+    name: String(cString: namePointer), homeDirectory: String(cString: homePointer))
+}
+
 private func username(for uid: uid_t) -> String? {
-  let users = run("/usr/bin/dscl", [".", "-search", "/Users", "UniqueID", String(uid)])
-  return users.stdout.split(whereSeparator: { $0.isWhitespace }).first.map(String.init)
+  userRecord(for: uid)?.name
 }
 
 private func expandedPlistPath(for job: ManagedJob, uid: uid_t) -> String {
   guard job.plistPath.hasPrefix("~/") else { return job.plistPath }
-  guard let username = username(for: uid) else {
-    return job.plistPath
+  guard let homeDirectory = userRecord(for: uid)?.homeDirectory else { return job.plistPath }
+  return homeDirectory + String(job.plistPath.dropFirst())
+}
+
+private func isLoaded(_ job: ManagedJob, uid: uid_t) throws -> Bool {
+  let result = run("/bin/launchctl", ["print", job.target(uid: uid)], timeout: 2)
+  switch LaunchctlPrintDecision.evaluate(exitStatus: result.status) {
+  case .loaded: return true
+  case .notLoaded: return false
+  case .failed:
+    throw commandFailure(
+      englishSubject: "the launch state of \(job.name)",
+      chineseSubject: "\(job.name) 的 launchd 加载状态", result: result)
   }
-  let homeResult = run("/usr/bin/dscl", [".", "-read", "/Users/\(username)", "NFSHomeDirectory"])
-  guard let home = homeResult.stdout.split(whereSeparator: { $0.isWhitespace }).last else {
-    return job.plistPath
+}
+
+private func processPIDs(_ job: ManagedJob) throws -> [Int32] {
+  try matchingPIDs(job.processPattern, englishSubject: job.name, chineseSubject: job.name)
+}
+
+private func matchingPIDs(
+  _ pattern: String, englishSubject: String = "related processes",
+  chineseSubject: String = "相关进程"
+) throws -> [Int32] {
+  let result = run("/usr/bin/pgrep", ["-f", pattern], timeout: 2)
+  switch PgrepDecision.evaluate(exitStatus: result.status) {
+  case .noMatches:
+    return []
+  case .failed:
+    throw commandFailure(
+      englishSubject: englishSubject, chineseSubject: chineseSubject, result: result)
+  case .matches:
+    let fields = result.stdout.split(whereSeparator: { $0.isWhitespace })
+    let pids = fields.compactMap { Int32($0) }
+    guard !fields.isEmpty, pids.count == fields.count else {
+      throw InspectionFailure(
+        english: "Could not inspect \(englishSubject): pgrep returned malformed output",
+        chinese: "无法检查\(chineseSubject)：pgrep 返回了格式错误的结果")
+    }
+    return Array(Set(pids)).sorted()
   }
-  return String(home) + String(job.plistPath.dropFirst())
 }
 
-private func isLoaded(_ job: ManagedJob, uid: uid_t) -> Bool {
-  run("/bin/launchctl", ["print", job.target(uid: uid)]).status == 0
-}
-
-private func processPIDs(_ job: ManagedJob) -> [Int32] {
-  matchingPIDs(job.processPattern)
-}
-
-private func matchingPIDs(_ pattern: String) -> [Int32] {
-  let result = run("/usr/bin/pgrep", ["-f", pattern])
-  guard result.status == 0 else { return [] }
-  return result.stdout.split(whereSeparator: { $0.isWhitespace }).compactMap { Int32($0) }.sorted()
-}
-
-private func clientApplicationPIDs() -> [Int32] {
-  Array(Set(clientApplications.flatMap { matchingPIDs($0.processPattern) })).sorted()
+private func clientApplicationPIDs() throws -> [Int32] {
+  var pids = Set<Int32>()
+  for application in clientApplications {
+    pids.formUnion(
+      try matchingPIDs(
+        application.processPattern, englishSubject: "the \(application.name) client process",
+        chineseSubject: "\(application.name) 客户端进程"))
+  }
+  return pids.sorted()
 }
 
 private func installedClientApplication() -> (name: String, path: String, processPattern: String)? {
@@ -315,8 +471,8 @@ private enum ClientApplicationStartResult {
   case failed(String)
 }
 
-private func startClientApplicationIfAvailable(uid: uid_t) -> ClientApplicationStartResult {
-  if !clientApplicationPIDs().isEmpty { return .alreadyRunning }
+private func startClientApplicationIfAvailable(uid: uid_t) throws -> ClientApplicationStartResult {
+  if try !clientApplicationPIDs().isEmpty { return .alreadyRunning }
   guard let application = installedClientApplication() else { return .notInstalled }
   guard let username = username(for: uid) else {
     return .failed(
@@ -338,7 +494,10 @@ private func startClientApplicationIfAvailable(uid: uid_t) -> ClientApplicationS
   }
   let deadline = Date().addingTimeInterval(8)
   while Date() < deadline {
-    if !matchingPIDs(application.processPattern).isEmpty { return .started(application.name) }
+    if try !matchingPIDs(
+      application.processPattern, englishSubject: "the \(application.name) client process",
+      chineseSubject: "\(application.name) 客户端进程"
+    ).isEmpty { return .started(application.name) }
     Thread.sleep(forTimeInterval: 0.25)
   }
   return .failed(
@@ -349,7 +508,7 @@ private func startClientApplicationIfAvailable(uid: uid_t) -> ClientApplicationS
 
 private func plistFlags(path: String) -> Set<String> {
   guard FileManager.default.fileExists(atPath: path) else { return [] }
-  let result = run("/usr/bin/stat", ["-f", "%Sf", path])
+  let result = run("/usr/bin/stat", ["-f", "%Sf", path], timeout: 2)
   guard result.status == 0 else { return [] }
   return Set(
     result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -359,7 +518,7 @@ private func plistFlags(path: String) -> Set<String> {
 private func clearImmutableFlags(path: String) -> Set<String>? {
   let protected = plistFlags(path: path).intersection(["schg", "uchg"])
   for flag in protected.sorted() {
-    let result = run("/usr/bin/chflags", ["no\(flag)", path])
+    let result = run("/usr/bin/chflags", ["no\(flag)", path], timeout: 3)
     if result.status != 0 {
       fputs(
         message(
@@ -372,8 +531,9 @@ private func clearImmutableFlags(path: String) -> Set<String>? {
 }
 
 private func restoreImmutableFlags(_ flags: Set<String>, path: String) -> Bool {
+  if flags.isEmpty { return true }
   for flag in flags.sorted() {
-    let result = run("/usr/bin/chflags", [flag, path])
+    let result = run("/usr/bin/chflags", [flag, path], timeout: 3)
     if result.status != 0 {
       fputs(
         message(
@@ -385,58 +545,67 @@ private func restoreImmutableFlags(_ flags: Set<String>, path: String) -> Bool {
   return flags.isSubset(of: plistFlags(path: path))
 }
 
-private func isDisabled(_ job: ManagedJob, uid: uid_t) -> Bool {
-  let result = run("/bin/launchctl", ["print-disabled", job.domainName(uid: uid)])
+private func isDisabled(_ job: ManagedJob, uid: uid_t) throws -> Bool {
+  let result = run(
+    "/bin/launchctl", ["print-disabled", job.domainName(uid: uid)], timeout: 2)
+  guard ZeroExitCommandDecision.evaluate(exitStatus: result.status) == .succeeded else {
+    throw commandFailure(
+      englishSubject: "the policy state of \(job.name)",
+      chineseSubject: "\(job.name) 的策略状态", result: result)
+  }
   return result.stdout.contains("\"\(job.label)\" => disabled")
 }
 
-private func waitForJob(_ job: ManagedJob, uid: uid_t, running: Bool, timeout: TimeInterval) -> Bool
+private func waitForJob(
+  _ job: ManagedJob, uid: uid_t, running: Bool, timeout: TimeInterval
+) throws -> Bool
 {
   let deadline = Date().addingTimeInterval(timeout)
   while Date() < deadline {
-    let loaded = isLoaded(job, uid: uid)
-    let pids = processPIDs(job)
+    let loaded = try isLoaded(job, uid: uid)
+    let pids = try processPIDs(job)
     if running, loaded, !job.expectsResidentProcess || !pids.isEmpty { return true }
     if !running, !loaded, pids.isEmpty { return true }
     Thread.sleep(forTimeInterval: 0.25)
   }
-  let loaded = isLoaded(job, uid: uid)
-  let pids = processPIDs(job)
+  let loaded = try isLoaded(job, uid: uid)
+  let pids = try processPIDs(job)
   return running
     ? loaded && (!job.expectsResidentProcess || !pids.isEmpty) : !loaded && pids.isEmpty
 }
 
-private func terminateProcesses(_ job: ManagedJob) {
-  for pid in processPIDs(job) { _ = kill(pid, SIGTERM) }
+private func terminateProcesses(_ job: ManagedJob) throws {
+  for pid in try processPIDs(job) { _ = kill(pid, SIGTERM) }
   let deadline = Date().addingTimeInterval(2)
   while Date() < deadline {
-    if processPIDs(job).isEmpty { return }
+    if try processPIDs(job).isEmpty { return }
     Thread.sleep(forTimeInterval: 0.2)
   }
-  for pid in processPIDs(job) { _ = kill(pid, SIGKILL) }
+  for pid in try processPIDs(job) { _ = kill(pid, SIGKILL) }
 }
 
-private func auxiliaryProcesses() -> (names: [String], pids: [Int32]) {
+private func auxiliaryProcesses() throws -> (names: [String], pids: [Int32]) {
   var names: [String] = []
   var pids = Set<Int32>()
   for item in auxiliaryProcessPatterns {
     let name = message(item.englishName, item.chineseName)
     let pattern = item.pattern
-    let matches = matchingPIDs(pattern)
+    let matches = try matchingPIDs(
+      pattern, englishSubject: item.englishName, chineseSubject: item.chineseName)
     if !matches.isEmpty { names.append(name) }
     pids.formUnion(matches)
   }
   return (names, pids.sorted())
 }
 
-private func terminateAuxiliaryProcesses() {
-  for pid in auxiliaryProcesses().pids { _ = kill(pid, SIGTERM) }
+private func terminateAuxiliaryProcesses() throws {
+  for pid in try auxiliaryProcesses().pids { _ = kill(pid, SIGTERM) }
   let deadline = Date().addingTimeInterval(2)
   while Date() < deadline {
-    if auxiliaryProcesses().pids.isEmpty { return }
+    if try auxiliaryProcesses().pids.isEmpty { return }
     Thread.sleep(forTimeInterval: 0.2)
   }
-  for pid in auxiliaryProcesses().pids { _ = kill(pid, SIGKILL) }
+  for pid in try auxiliaryProcesses().pids { _ = kill(pid, SIGKILL) }
 }
 
 private func readSnapshot() -> RestoreSnapshot? {
@@ -498,9 +667,13 @@ private func removePendingRestore(_ id: String) {
   }
 }
 
-private func activeRelatedSystemExtensions() -> [String] {
+private func activeRelatedSystemExtensions() throws -> [String] {
   let result = run("/usr/bin/systemextensionsctl", ["list"])
-  guard result.status == 0 else { return [] }
+  guard ZeroExitCommandDecision.evaluate(exitStatus: result.status) == .succeeded else {
+    throw commandFailure(
+      englishSubject: "related System Extensions", chineseSubject: "相关 System Extension",
+      result: result)
+  }
   let identifiers = [
     "com.byteplus.sealsuite.networkextension", "com.volcengine.corplink.systemextension",
   ]
@@ -529,7 +702,7 @@ private func findJSONValue(key: String, in value: Any) -> Any? {
 private func connectionStatus(_ kind: String) -> String {
   let cliPath = "/usr/local/corplink/corplink-cli"
   guard FileManager.default.isExecutableFile(atPath: cliPath) else { return "unavailable" }
-  let result = run(cliPath, ["--format", "json", kind, "status"])
+  let result = run(cliPath, ["--format", "json", kind, "status"], timeout: 3)
   guard result.status == 0, let data = result.stdout.data(using: .utf8),
     let json = try? JSONSerialization.jsonObject(with: data)
   else { return "unavailable" }
@@ -543,9 +716,9 @@ private func connectionStatus(_ kind: String) -> String {
   return "unknown"
 }
 
-private func stopJob(_ job: ManagedJob, uid: uid_t, recordRestore: Bool) -> String? {
-  let loadedBefore = isLoaded(job, uid: uid)
-  let pidsBefore = processPIDs(job)
+private func stopJob(_ job: ManagedJob, uid: uid_t, recordRestore: Bool) throws -> String? {
+  let loadedBefore = try isLoaded(job, uid: uid)
+  let pidsBefore = try processPIDs(job)
   if !loadedBefore, pidsBefore.isEmpty { return nil }
   if recordRestore, loadedBefore, !addPendingRestore(job.id) {
     return message(
@@ -558,11 +731,16 @@ private func stopJob(_ job: ManagedJob, uid: uid_t, recordRestore: Bool) -> Stri
       "\(job.name): could not temporarily remove immutable plist flags",
       "\(job.name)：无法临时移除 plist 不可变属性")
   }
+  var restorationAttempted = false
+  defer {
+    if !restorationAttempted { _ = restoreImmutableFlags(removedFlags, path: path) }
+  }
   var error: String?
   if loadedBefore {
-    var result = run("/bin/launchctl", ["bootout", job.target(uid: uid)])
+    var result = run("/bin/launchctl", ["bootout", job.target(uid: uid)], timeout: 4)
     if result.status != 0 {
-      result = run("/bin/launchctl", ["bootout", job.domainName(uid: uid), path])
+      result = run(
+        "/bin/launchctl", ["bootout", job.domainName(uid: uid), path], timeout: 4)
     }
     if result.status != 0 {
       error = message(
@@ -570,14 +748,17 @@ private func stopJob(_ job: ManagedJob, uid: uid_t, recordRestore: Bool) -> Stri
         "\(job.name)：launchctl bootout 失败：\(result.stderr)")
     }
   }
-  if error == nil, !waitForJob(job, uid: uid, running: false, timeout: 3) {
-    if !isLoaded(job, uid: uid), !processPIDs(job).isEmpty { terminateProcesses(job) }
-    if !waitForJob(job, uid: uid, running: false, timeout: 3) {
+  if error == nil, try !waitForJob(job, uid: uid, running: false, timeout: 3) {
+    if try !isLoaded(job, uid: uid), try !processPIDs(job).isEmpty {
+      try terminateProcesses(job)
+    }
+    if try !waitForJob(job, uid: uid, running: false, timeout: 3) {
       error = message(
         "\(job.name): the job or process is still present",
         "\(job.name)：任务或进程仍然存在")
     }
   }
+  restorationAttempted = true
   if !restoreImmutableFlags(removedFlags, path: path) {
     let flagError = message(
       "\(job.name): failed to restore the original plist protection flags",
@@ -587,9 +768,235 @@ private func stopJob(_ job: ManagedJob, uid: uid_t, recordRestore: Bool) -> Stri
   return error
 }
 
-private func startJob(_ job: ManagedJob, uid: uid_t) -> String? {
+private final class StopErrorCollector: @unchecked Sendable {
+  private let lock = NSLock()
+  private var errors: [String: String] = [:]
+
+  func record(_ error: String, for id: String) {
+    lock.lock()
+    errors[id] = error
+    lock.unlock()
+  }
+
+  func ordered(for ids: [String]) -> [String] {
+    lock.lock()
+    defer { lock.unlock() }
+    return ids.compactMap { errors[$0] }
+  }
+}
+
+private struct JobResidue: Sendable {
+  let id: String
+  let name: String
+  let loaded: Bool
+  let pids: [Int32]
+}
+
+private final class JobResidueCollector: @unchecked Sendable {
+  private let lock = NSLock()
+  private var residues: [JobResidue] = []
+  private var failures: [String: InspectionFailure] = [:]
+
+  func append(_ residue: JobResidue) {
+    lock.lock()
+    residues.append(residue)
+    lock.unlock()
+  }
+
+  func record(_ failure: InspectionFailure, for id: String) {
+    lock.lock()
+    failures[id] = failure
+    lock.unlock()
+  }
+
+  func result(for ids: [String]) throws -> [JobResidue] {
+    lock.lock()
+    defer { lock.unlock() }
+    if let failure = ids.compactMap({ failures[$0] }).first { throw failure }
+    return residues.sorted { $0.id < $1.id }
+  }
+}
+
+private func requestJobStop(_ job: ManagedJob, uid: uid_t) throws -> String? {
+  let loadedBefore = try isLoaded(job, uid: uid)
+  if !loadedBefore, try processPIDs(job).isEmpty { return nil }
   let path = expandedPlistPath(for: job, uid: uid)
-  if waitForJob(job, uid: uid, running: true, timeout: 0.1) {
+  guard let removedFlags = clearImmutableFlags(path: path) else {
+    return message(
+      "\(job.name): could not temporarily remove immutable plist flags",
+      "\(job.name)：无法临时移除 plist 不可变属性")
+  }
+  var restorationAttempted = false
+  defer {
+    if !restorationAttempted { _ = restoreImmutableFlags(removedFlags, path: path) }
+  }
+
+  var error: String?
+  if loadedBefore {
+    var result = run(
+      "/bin/launchctl", ["bootout", job.target(uid: uid)], timeout: 4)
+    if result.status != 0 {
+      result = run(
+        "/bin/launchctl", ["bootout", job.domainName(uid: uid), path], timeout: 4)
+    }
+    if result.status != 0, try isLoaded(job, uid: uid) {
+      error = message(
+        "\(job.name): launchctl bootout failed: \(result.stderr)",
+        "\(job.name)：launchctl bootout 失败：\(result.stderr)")
+    }
+  }
+  restorationAttempted = true
+  if !restoreImmutableFlags(removedFlags, path: path) {
+    let flagError = message(
+      "\(job.name): failed to restore the original plist protection flags",
+      "\(job.name)：plist 原有保护属性恢复失败")
+    error = error.map { "\($0)\(message("; ", "；"))\(flagError)" } ?? flagError
+  }
+  return error
+}
+
+private func requestStopsConcurrently(_ ids: [String], uid: uid_t) -> [String] {
+  let collector = StopErrorCollector()
+  let group = DispatchGroup()
+  for id in ids {
+    guard let job = jobs.first(where: { $0.id == id }) else { continue }
+    group.enter()
+    DispatchQueue.global(qos: .utility).async {
+      defer { group.leave() }
+      do {
+        if let error = try requestJobStop(job, uid: uid) { collector.record(error, for: id) }
+      } catch let error as InspectionFailure {
+        collector.record(error.localizedMessage, for: id)
+      } catch {
+        collector.record(error.localizedDescription, for: id)
+      }
+    }
+  }
+  group.wait()
+  return collector.ordered(for: ids)
+}
+
+private func runtimeResidues(uid: uid_t) throws -> [JobResidue] {
+  let collector = JobResidueCollector()
+  let group = DispatchGroup()
+  for job in jobs {
+    group.enter()
+    DispatchQueue.global(qos: .utility).async {
+      defer { group.leave() }
+      do {
+        let loaded = try isLoaded(job, uid: uid)
+        let pids = try processPIDs(job)
+        if loaded || !pids.isEmpty {
+          collector.append(JobResidue(id: job.id, name: job.name, loaded: loaded, pids: pids))
+        }
+      } catch let failure as InspectionFailure {
+        collector.record(failure, for: job.id)
+      } catch {
+        collector.record(
+          InspectionFailure(
+            english: error.localizedDescription, chinese: error.localizedDescription),
+          for: job.id)
+      }
+    }
+  }
+  group.wait()
+  return try collector.result(for: jobs.map(\.id))
+}
+
+private func terminateResidueProcesses(_ residues: [JobResidue]) -> [String] {
+  let collector = StopErrorCollector()
+  let group = DispatchGroup()
+  for residue in residues where !residue.pids.isEmpty {
+    guard let job = jobs.first(where: { $0.id == residue.id }) else { continue }
+    group.enter()
+    DispatchQueue.global(qos: .utility).async {
+      defer { group.leave() }
+      do {
+        try terminateProcesses(job)
+      } catch let error as InspectionFailure {
+        collector.record(error.localizedMessage, for: residue.id)
+      } catch {
+        collector.record(error.localizedDescription, for: residue.id)
+      }
+    }
+  }
+  group.wait()
+  return collector.ordered(for: residues.map(\.id))
+}
+
+private func convergeStoppedSuite(uid: uid_t) throws -> [String] {
+  var retryCount = 0
+  var stableSince: Date?
+  let deadline = Date().addingTimeInterval(15)
+
+  while Date() < deadline {
+    let residues = try runtimeResidues(uid: uid)
+    let auxiliary = try auxiliaryProcesses()
+    let decision = StopConvergenceDecision.evaluate(
+      loadedJobCount: residues.filter(\.loaded).count,
+      processCount: residues.reduce(0) { $0 + $1.pids.count } + auxiliary.pids.count,
+      retriesPerformed: retryCount)
+
+    switch decision {
+    case .converged:
+      if stableSince == nil { stableSince = Date() }
+      if let stableSince, Date().timeIntervalSince(stableSince) >= 5 { return [] }
+    case .retry:
+      stableSince = nil
+      let retryErrors = requestStopsConcurrently(residues.map(\.id), uid: uid)
+      let terminationErrors = terminateResidueProcesses(residues)
+      try terminateAuxiliaryProcesses()
+      retryCount += 1
+      if !retryErrors.isEmpty || !terminationErrors.isEmpty {
+        return retryErrors + terminationErrors
+      }
+    case .failed:
+      let names = residues.map(\.name)
+      var errors: [String] = []
+      if !names.isEmpty {
+        errors.append(
+          message(
+            "Jobs or processes remain: \(names.joined(separator: ", "))",
+            "仍有任务或进程：\(names.joined(separator: "、"))"))
+      }
+      if !auxiliary.pids.isEmpty {
+        errors.append(
+          message(
+            "Auxiliary processes remain: \(auxiliary.names.joined(separator: ", "))",
+            "仍有辅助进程：\(auxiliary.names.joined(separator: "、"))"))
+      }
+      return errors
+    }
+    Thread.sleep(forTimeInterval: 0.5)
+  }
+
+  let residues = try runtimeResidues(uid: uid)
+  let auxiliary = try auxiliaryProcesses()
+  var errors: [String] = []
+  if !residues.isEmpty {
+    errors.append(
+      message(
+        "Stop verification timed out; jobs or processes remain: \(residues.map(\.name).joined(separator: ", "))",
+        "停止验证超时，仍有任务或进程：\(residues.map(\.name).joined(separator: "、"))"))
+  }
+  if !auxiliary.pids.isEmpty {
+    errors.append(
+      message(
+        "Stop verification timed out; auxiliary processes remain: \(auxiliary.names.joined(separator: ", "))",
+        "停止验证超时，仍有辅助进程：\(auxiliary.names.joined(separator: "、"))"))
+  }
+  if errors.isEmpty {
+    errors.append(
+      message(
+        "Stop verification did not reach a five-second stable state.",
+        "停止验证未达到连续 5 秒稳定状态。"))
+  }
+  return errors
+}
+
+private func startJob(_ job: ManagedJob, uid: uid_t) throws -> String? {
+  let path = expandedPlistPath(for: job, uid: uid)
+  if try waitForJob(job, uid: uid, running: true, timeout: 0.1) {
     if !restoreSavedPlistIfNeeded(job, path: path, uid: uid) {
       return message(
         "\(job.name): the job is running, but its saved plist could not be restored",
@@ -598,7 +1005,7 @@ private func startJob(_ job: ManagedJob, uid: uid_t) -> String? {
     removePendingRestore(job.id)
     return nil
   }
-  if isDisabled(job, uid: uid) {
+  if try isDisabled(job, uid: uid) {
     return message(
       "\(job.name): disabled by system or organization policy; no override was attempted",
       "\(job.name)：已被系统或组织策略禁用，未擅自修改")
@@ -613,8 +1020,12 @@ private func startJob(_ job: ManagedJob, uid: uid_t) -> String? {
       "\(job.name): could not temporarily remove immutable plist flags",
       "\(job.name)：无法临时移除 plist 不可变属性")
   }
+  var restorationAttempted = false
+  defer {
+    if !restorationAttempted { _ = restoreImmutableFlags(removedFlags, path: path) }
+  }
   var result = run("/bin/launchctl", ["bootstrap", job.domainName(uid: uid), path])
-  if result.status != 0, isLoaded(job, uid: uid) {
+  if result.status != 0, try isLoaded(job, uid: uid) {
     result = run("/bin/launchctl", ["kickstart", "-k", job.target(uid: uid)])
   }
   var error: String?
@@ -622,7 +1033,7 @@ private func startJob(_ job: ManagedJob, uid: uid_t) -> String? {
     error = message(
       "\(job.name): failed to start: \(result.stderr)",
       "\(job.name)：启动失败：\(result.stderr)")
-  } else if !waitForJob(job, uid: uid, running: true, timeout: 8) {
+  } else if try !waitForJob(job, uid: uid, running: true, timeout: 8) {
     error = message(
       "\(job.name): post-start verification failed", "\(job.name)：启动后验证失败")
   } else {
@@ -635,6 +1046,7 @@ private func startJob(_ job: ManagedJob, uid: uid_t) -> String? {
         "\(job.name)：已启动，但停止前的 plist 无法恢复")
     }
   }
+  restorationAttempted = true
   if !restoreImmutableFlags(removedFlags, path: path) {
     let flagError = message(
       "\(job.name): failed to restore the original plist protection flags",
@@ -654,13 +1066,13 @@ private func requireRoot(_ action: String) -> Bool {
   return true
 }
 
-private func stopComponent(id: String) -> Int32 {
+private func stopComponent(id: String) throws -> Int32 {
   guard requireRoot(message("stop a component", "停止组件")) else { return 77 }
   guard let job = jobs.first(where: { $0.id == id }) else {
     fputs(message("Unknown component: \(id)\n", "未知组件：\(id)\n"), stderr)
     return 2
   }
-  if let error = stopJob(job, uid: consoleUID(), recordRestore: true) {
+  if let error = try stopJob(job, uid: consoleUID(), recordRestore: true) {
     fputs("\(error)\n", stderr)
     return 1
   }
@@ -671,13 +1083,13 @@ private func stopComponent(id: String) -> Int32 {
   return 0
 }
 
-private func startComponent(id: String) -> Int32 {
+private func startComponent(id: String) throws -> Int32 {
   guard requireRoot(message("start a component", "启动组件")) else { return 77 }
   guard let job = jobs.first(where: { $0.id == id }) else {
     fputs(message("Unknown component: \(id)\n", "未知组件：\(id)\n"), stderr)
     return 2
   }
-  if let error = startJob(job, uid: consoleUID()) {
+  if let error = try startJob(job, uid: consoleUID()) {
     fputs("\(error)\n", stderr)
     return job.launchOnlyOnce ? 4 : 1
   }
@@ -685,10 +1097,11 @@ private func startComponent(id: String) -> Int32 {
   return 0
 }
 
-private func stopSuite() -> Int32 {
+private func stopSuite() throws -> Int32 {
   guard requireRoot(message("stop the complete Corplink suite", "停止整套飞连")) else { return 77 }
   let uid = consoleUID()
-  let loadedIDs = Set(jobs.filter { isLoaded($0, uid: uid) }.map(\.id))
+  var loadedIDs = Set<String>()
+  for job in jobs where try isLoaded(job, uid: uid) { loadedIDs.insert(job.id) }
   let pendingIDs = loadedIDs.union(readSnapshot()?.pendingJobIDs ?? [])
   var savedPlists = readSnapshot()?.savedPlists ?? [:]
   if let clientJob = jobs.first(where: { $0.id == "client" }) {
@@ -697,42 +1110,29 @@ private func stopSuite() -> Int32 {
       savedPlists[clientJob.id] = data
     }
   }
-  guard
-    writeSnapshot(
-      RestoreSnapshot(createdAt: Date(), pendingJobIDs: pendingIDs, savedPlists: savedPlists)
-    )
-  else {
-    return 1
+  if pendingIDs.isEmpty {
+    try? FileManager.default.removeItem(atPath: snapshotPath)
+  } else {
+    guard
+      writeSnapshot(
+        RestoreSnapshot(createdAt: Date(), pendingJobIDs: pendingIDs, savedPlists: savedPlists)
+      )
+    else {
+      return 1
+    }
   }
-  let stopOrder = [
-    "client", "network-agent", "app-blocker", "data-forwarder", "mdm",
-    "connection", "network-monitor", "protection",
-  ]
+
   var errors: [String] = []
-  for id in stopOrder {
-    guard let job = jobs.first(where: { $0.id == id }) else { continue }
-    if let error = stopJob(job, uid: uid, recordRestore: false) { errors.append(error) }
-  }
-  terminateAuxiliaryProcesses()
-  let deadline = Date().addingTimeInterval(5)
-  while Date() < deadline {
-    Thread.sleep(forTimeInterval: 0.5)
-  }
-  let residues = jobs.filter { isLoaded($0, uid: uid) || !processPIDs($0).isEmpty }.map(\.name)
-  if !residues.isEmpty {
-    errors.append(
-      message(
-        "Jobs or processes remain: \(residues.joined(separator: ", "))",
-        "仍有任务或进程：\(residues.joined(separator: "、"))"))
-  }
-  let auxiliaryResidues = auxiliaryProcesses()
-  if !auxiliaryResidues.pids.isEmpty {
-    errors.append(
-      message(
-        "Auxiliary processes remain: \(auxiliaryResidues.names.joined(separator: ", "))",
-        "仍有辅助进程：\(auxiliaryResidues.names.joined(separator: "、"))"))
-  }
-  let extensions = activeRelatedSystemExtensions()
+  errors.append(
+    contentsOf: requestStopsConcurrently(
+      ["client", "network-agent", "app-blocker"], uid: uid))
+  errors.append(
+    contentsOf: requestStopsConcurrently(
+      ["data-forwarder", "mdm", "connection", "network-monitor", "protection"],
+      uid: uid))
+  try terminateAuxiliaryProcesses()
+  errors.append(contentsOf: try convergeStoppedSuite(uid: uid))
+  let extensions = try activeRelatedSystemExtensions()
   guard errors.isEmpty else {
     fputs(errors.joined(separator: "\n") + "\n", stderr)
     return 1
@@ -753,7 +1153,7 @@ private func stopSuite() -> Int32 {
   return 0
 }
 
-private func startSuite() -> Int32 {
+private func startSuite() throws -> Int32 {
   guard requireRoot(message("start the complete Corplink suite", "启动整套飞连")) else { return 77 }
   let uid = consoleUID()
   let startOrder = [
@@ -770,8 +1170,8 @@ private func startSuite() -> Int32 {
     let path = expandedPlistPath(for: job, uid: uid)
     let facts = ComponentFacts(
       plistPresent: FileManager.default.fileExists(atPath: path),
-      loaded: isLoaded(job, uid: uid),
-      processCount: processPIDs(job).count,
+      loaded: try isLoaded(job, uid: uid),
+      processCount: try processPIDs(job).count,
       pendingRestore: snapshot?.pendingJobIDs.contains(job.id) == true)
     let installed = job.id == "client" ? facts.hasLaunchJobEvidence : facts.isInstalled
     if job.id == "client" { clientLaunchJobInstalled = installed }
@@ -779,14 +1179,14 @@ private func startSuite() -> Int32 {
       skipped.append(message("\(job.name) (not installed)", "\(job.name)（未安装）"))
       continue
     }
-    if isDisabled(job, uid: uid) {
+    if try isDisabled(job, uid: uid) {
       skipped.append(message("\(job.name) (disabled by policy)", "\(job.name)（策略禁用）"))
       continue
     }
-    if let error = startJob(job, uid: uid) { errors.append(error) }
+    if let error = try startJob(job, uid: uid) { errors.append(error) }
   }
   if !clientLaunchJobInstalled {
-    switch startClientApplicationIfAvailable(uid: uid) {
+    switch try startClientApplicationIfAvailable(uid: uid) {
     case .notInstalled, .alreadyRunning:
       break
     case .started(let name):
@@ -813,7 +1213,7 @@ private func startSuite() -> Int32 {
   return 0
 }
 
-private func restoreSuite() -> Int32 {
+private func restoreSuite() throws -> Int32 {
   guard requireRoot(message("restore the Corplink suite", "恢复整套飞连")) else { return 77 }
   guard let snapshot = readSnapshot(), !snapshot.pendingJobIDs.isEmpty else {
     fputs(
@@ -830,7 +1230,7 @@ private func restoreSuite() -> Int32 {
   var errors: [String] = []
   for id in startOrder where snapshot.pendingJobIDs.contains(id) {
     guard let job = jobs.first(where: { $0.id == id }) else { continue }
-    if let error = startJob(job, uid: uid) { errors.append(error) }
+    if let error = try startJob(job, uid: uid) { errors.append(error) }
   }
   guard errors.isEmpty else {
     fputs(errors.joined(separator: "\n") + "\n", stderr)
@@ -843,21 +1243,22 @@ private func restoreSuite() -> Int32 {
   return 0
 }
 
-private func printStatus() -> Int32 {
+private func printStatus() throws -> Int32 {
   let uid = consoleUID()
   let snapshot = readSnapshot()
-  let extensions = activeRelatedSystemExtensions()
-  let auxiliary = auxiliaryProcesses()
+  let extensions = try activeRelatedSystemExtensions()
+  let auxiliary = try auxiliaryProcesses()
   var loadedCount = 0
   var installedCount = 0
   var processCount = 0
   var inconsistent = false
+  var connectionRuntimeAvailable = false
   for job in jobs {
-    let loaded = isLoaded(job, uid: uid)
-    let pids = processPIDs(job)
+    let loaded = try isLoaded(job, uid: uid)
+    let pids = try processPIDs(job)
     let path = expandedPlistPath(for: job, uid: uid)
     let flags = plistFlags(path: path).filter { $0 != "-" }.sorted()
-    let disabled = isDisabled(job, uid: uid)
+    let disabled = try isDisabled(job, uid: uid)
     let pending = snapshot?.pendingJobIDs.contains(job.id) == true
     let restartRequired = job.launchOnlyOnce && pending && !loaded
     let facts = ComponentFacts(
@@ -868,6 +1269,7 @@ private func printStatus() -> Int32 {
     if loaded { loadedCount += 1 }
     if present { installedCount += 1 }
     processCount += pids.count
+    if job.id == "connection" { connectionRuntimeAvailable = loaded || !pids.isEmpty }
     if loaded != (!pids.isEmpty), job.expectsResidentProcess { inconsistent = true }
     let fields = [
       loaded ? "1" : "0", pids.map(String.init).joined(separator: ":"),
@@ -890,11 +1292,11 @@ private func printStatus() -> Int32 {
   print("restore_pending=\(snapshot?.pendingJobIDs.sorted().joined(separator: ",") ?? "")")
   print("auxiliary_components=\(auxiliary.names.joined(separator: ","))")
   print("auxiliary_pids=\(auxiliary.pids.map(String.init).joined(separator: ","))")
-  print("vpn=\(connectionStatus("vpn"))")
-  print("swg=\(connectionStatus("swg"))")
+  print("vpn=\(connectionRuntimeAvailable ? connectionStatus("vpn") : "unavailable")")
+  print("swg=\(connectionRuntimeAvailable ? connectionStatus("swg") : "unavailable")")
   print("system_extensions=\(extensions.joined(separator: ","))")
   print("client_app_present=\(installedClientApplication() == nil ? "false" : "true")")
-  print("client_app_running=\(clientApplicationPIDs().isEmpty ? "false" : "true")")
+  print("client_app_running=\(try clientApplicationPIDs().isEmpty ? "false" : "true")")
   if clean { return 3 }
   if inconsistent { return 1 }
   return 0
@@ -955,29 +1357,41 @@ private func printHelp() {
   }
 }
 
-private func executeCommand(_ command: String) -> Int32 {
+private func executeCommandThrowing(_ command: String) throws -> Int32 {
   switch command {
   case "help", "--help", "-h":
     printHelp()
     return 0
-  case "status": return printStatus()
-  case "start": return startComponent(id: "connection")
-  case "stop": return stopComponent(id: "connection")
-  case "stop-suite": return stopSuite()
-  case "start-suite": return startSuite()
-  case "restore-suite": return restoreSuite()
+  case "status": return try printStatus()
+  case "start": return try startComponent(id: "connection")
+  case "stop": return try stopComponent(id: "connection")
+  case "stop-suite": return try stopSuite()
+  case "start-suite": return try startSuite()
+  case "restore-suite": return try restoreSuite()
   default:
     break
   }
   if command.hasPrefix("stop-component:") {
-    return stopComponent(id: String(command.dropFirst("stop-component:".count)))
+    return try stopComponent(id: String(command.dropFirst("stop-component:".count)))
   }
   if command.hasPrefix("start-component:") {
-    return startComponent(id: String(command.dropFirst("start-component:".count)))
+    return try startComponent(id: String(command.dropFirst("start-component:".count)))
   }
   fputs(message("Unknown command: \(command)\n", "未知命令：\(command)\n"), stderr)
   printHelp()
   return 2
+}
+
+private func executeCommand(_ command: String) -> Int32 {
+  do {
+    return try executeCommandThrowing(command)
+  } catch let failure as InspectionFailure {
+    fputs("\(failure.localizedMessage)\n", stderr)
+    return HelperInspectionFailurePolicy.exitStatus(for: command)
+  } catch {
+    fputs("\(error.localizedDescription)\n", stderr)
+    return HelperInspectionFailurePolicy.exitStatus(for: command)
+  }
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())

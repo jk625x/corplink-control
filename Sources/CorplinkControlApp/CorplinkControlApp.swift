@@ -1,12 +1,15 @@
 import AppKit
 import Combine
 import CorplinkControlCore
+import Darwin
+import LocalAuthentication
 import ServiceManagement
 import SwiftUI
 
 private enum AppConstants {
   static let languageKey = "appLanguage"
   static let keepRunningKey = "keepRunningAfterWindowClose"
+  static let helperRegistrationFingerprintKey = "privilegedHelperRegistrationFingerprint-v1"
   static let serviceLabel = "com.volcengine.corplink.service"
   static let plistPath = "/Library/LaunchDaemons/com.volcengine.corplink.service.plist"
   static let executablePath = "/usr/local/corplink/corplink-service"
@@ -194,9 +197,184 @@ private struct CommandResult {
   let stderr: String
 }
 
-private enum PrivilegedExecutionMode {
+private func makeUnlinkedCaptureFile() -> FileHandle? {
+  var template = Array("/tmp/corplink-control.XXXXXX".utf8CString)
+  let descriptor = mkstemp(&template)
+  guard descriptor >= 0 else { return nil }
+  _ = unlink(template)
+  return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+}
+
+private func readCaptureFile(_ file: FileHandle) -> String {
+  do {
+    try file.seek(toOffset: 0)
+    return String(decoding: try file.readToEnd() ?? Data(), as: UTF8.self)
+  } catch {
+    return ""
+  }
+}
+
+private func runProcess(
+  _ executable: URL, arguments: [String], environment: [String: String] = [:],
+  timeout: TimeInterval? = nil
+) async -> CommandResult {
+  await Task.detached {
+    let process = Process()
+    guard let stdoutFile = makeUnlinkedCaptureFile(), let stderrFile = makeUnlinkedCaptureFile()
+    else {
+      return CommandResult(
+        status: 71, stdout: "", stderr: "Could not create command output capture files.")
+    }
+    process.executableURL = executable
+    process.arguments = arguments
+    if !environment.isEmpty {
+      process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+    }
+    process.standardOutput = stdoutFile
+    process.standardError = stderrFile
+    do {
+      try process.run()
+    } catch {
+      return CommandResult(status: 127, stdout: "", stderr: error.localizedDescription)
+    }
+    var timedOut = false
+    if let timeout {
+      let deadline = Date().addingTimeInterval(timeout)
+      while process.isRunning, Date() < deadline {
+        usleep(50_000)
+      }
+      if process.isRunning {
+        timedOut = true
+        process.terminate()
+        let terminationDeadline = Date().addingTimeInterval(1)
+        while process.isRunning, Date() < terminationDeadline {
+          usleep(50_000)
+        }
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+      }
+    }
+    process.waitUntilExit()
+    let stdout = readCaptureFile(stdoutFile)
+    let stderr = readCaptureFile(stderrFile)
+    if timedOut {
+      return CommandResult(
+        status: 124, stdout: stdout,
+        stderr: stderr.isEmpty ? "The command timed out." : stderr)
+    }
+    return CommandResult(
+      status: process.terminationStatus,
+      stdout: stdout,
+      stderr: stderr
+    )
+  }.value
+}
+
+private enum PrivilegedExecutionMode: Equatable {
   case xpc
   case administratorPrompt
+}
+
+private enum PrivilegedHelperAttempt {
+  case completed(CommandResult)
+  case fallbackAllowed(CommandResult)
+  case deliveryUncertain(CommandResult)
+}
+
+private enum PrivilegedExecutionPreparation {
+  case ready(mode: PrivilegedExecutionMode, migrationNotice: String?)
+  case cancelled(CommandResult)
+}
+
+private func currentProcessIsAdministrator() -> Bool {
+  if geteuid() == 0 { return true }
+  let groupCount = getgroups(0, nil)
+  guard groupCount > 0 else { return false }
+  var groups = [gid_t](repeating: 0, count: Int(groupCount))
+  return getgroups(groupCount, &groups) == groupCount
+    && groups.contains(gid_t(PrivilegedHelperConfiguration.administratorGroupID))
+}
+
+private func currentHelperRegistrationFingerprint() -> String? {
+  guard
+    let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+    let resourcesURL = Bundle.main.resourceURL,
+    let appRequirement = PrivilegedHelperConfiguration.designatedRequirement(
+      at: Bundle.main.bundleURL)
+  else { return nil }
+  let helperURL = resourcesURL.appendingPathComponent("corplink-root-helper", isDirectory: false)
+  guard
+    let helperRequirement = PrivilegedHelperConfiguration.designatedRequirement(at: helperURL)
+  else { return nil }
+  return PrivilegedHelperConfiguration.registrationFingerprint(
+    bundleVersion: build, appRequirement: appRequirement,
+    helperRequirement: helperRequirement)
+}
+
+private func registeredHelperMatchesCurrentBuild() -> Bool {
+  guard let currentFingerprint = currentHelperRegistrationFingerprint() else { return false }
+  return UserDefaults.standard.string(forKey: AppConstants.helperRegistrationFingerprintKey)
+    == currentFingerprint
+}
+
+private func recordCurrentHelperRegistration() {
+  guard let fingerprint = currentHelperRegistrationFingerprint() else { return }
+  UserDefaults.standard.set(fingerprint, forKey: AppConstants.helperRegistrationFingerprintKey)
+}
+
+private func clearRecordedHelperRegistration() {
+  UserDefaults.standard.removeObject(forKey: AppConstants.helperRegistrationFingerprintKey)
+}
+
+private func authenticateHelperRegistration(
+  _ language: AppLanguage, upgrading: Bool = false
+) async -> Bool {
+  let context = LAContext()
+  context.localizedCancelTitle = text(language, "Cancel", "取消")
+  let reason = upgrading
+    ? text(
+      language,
+      "Authenticate to update passwordless Corplink control for this administrator account.",
+      "请验证身份，以便为当前管理员账户升级飞连免密码控制。")
+    : text(
+      language,
+      "Authenticate to enable passwordless Corplink control for this administrator account.",
+      "请验证身份，以便为当前管理员账户开启飞连免密码控制。")
+  return (try? await context.evaluatePolicy(
+    .deviceOwnerAuthentication, localizedReason: reason)) == true
+}
+
+private func waitForPrivilegedHelperUnregistration(timeout: TimeInterval = 15) async -> Bool {
+  let deadline = Date().addingTimeInterval(timeout)
+  var inactiveSince: Date?
+  while Date() < deadline {
+    let status = SMAppService.daemon(
+      plistName: PrivilegedHelperConfiguration.daemonPlistName).status
+    let launchctlResult = await runProcess(
+      URL(fileURLWithPath: "/bin/launchctl"),
+      arguments: ["print", "system/\(PrivilegedHelperConfiguration.machServiceName)"],
+      timeout: 2)
+    let serviceManagementInactive: Bool
+    switch status {
+    case .notRegistered, .notFound:
+      serviceManagementInactive = true
+    case .enabled, .requiresApproval:
+      serviceManagementInactive = false
+    @unknown default:
+      return false
+    }
+    let decision = HelperUnregistrationDecision.evaluate(
+      serviceManagementInactive: serviceManagementInactive,
+      launchctlExitStatus: launchctlResult.status)
+    switch decision {
+    case .complete:
+      if inactiveSince == nil { inactiveSince = Date() }
+      if let inactiveSince, Date().timeIntervalSince(inactiveSince) >= 0.5 { return true }
+    case .waiting, .inspectionFailed:
+      inactiveSince = nil
+    }
+    try? await Task.sleep(nanoseconds: 100_000_000)
+  }
+  return false
 }
 
 @MainActor
@@ -213,6 +391,7 @@ private final class ServiceController: ObservableObject {
   @Published var message: String?
   @Published var isError = false
   @Published var isWarning = false
+  @Published var progressMessage: String?
   @Published var vpnStatus = "unknown"
   @Published var swgStatus = "unknown"
   @Published var components = ComponentStatus.definitions
@@ -296,7 +475,13 @@ private final class ServiceController: ObservableObject {
   private func privilegedExecutionMode() -> PrivilegedExecutionMode {
     let service = SMAppService.daemon(
       plistName: PrivilegedHelperConfiguration.daemonPlistName)
-    guard service.status == .enabled else { return .administratorPrompt }
+    guard
+      service.status == .enabled,
+      currentProcessIsAdministrator(),
+      registeredHelperMatchesCurrentBuild()
+    else {
+      return .administratorPrompt
+    }
 
     let appURL = Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL
     let applicationsURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
@@ -306,6 +491,91 @@ private final class ServiceController: ObservableObject {
       PrivilegedHelperConfiguration.designatedRequirement(at: appURL) != nil
     else { return .administratorPrompt }
     return .xpc
+  }
+
+  private func preparePrivilegedExecution(
+    helperURL: URL, language: AppLanguage
+  ) async -> PrivilegedExecutionPreparation {
+    let currentMode = privilegedExecutionMode()
+    if case .xpc = currentMode { return .ready(mode: .xpc, migrationNotice: nil) }
+
+    let service = SMAppService.daemon(
+      plistName: PrivilegedHelperConfiguration.daemonPlistName)
+    switch service.status {
+    case .enabled, .requiresApproval:
+      break
+    default:
+      return .ready(mode: .administratorPrompt, migrationNotice: nil)
+    }
+    guard !registeredHelperMatchesCurrentBuild() else {
+      return .ready(mode: .administratorPrompt, migrationNotice: nil)
+    }
+
+    let appURL = Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL
+    let applicationsURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+      .resolvingSymlinksInPath().standardizedFileURL
+    guard
+      currentProcessIsAdministrator(),
+      appURL.deletingLastPathComponent() == applicationsURL,
+      PrivilegedHelperConfiguration.designatedRequirement(at: appURL) != nil,
+      PrivilegedHelperConfiguration.designatedRequirement(at: helperURL) != nil,
+      currentHelperRegistrationFingerprint() != nil
+    else {
+      return .ready(
+        mode: .administratorPrompt,
+        migrationNotice: text(
+          language,
+          "The registered helper belongs to another build and could not be migrated safely. Password authorization was used.",
+          "已注册 helper 属于其他构建，无法安全迁移；本次改用密码授权。"))
+    }
+
+    guard await authenticateHelperRegistration(language, upgrading: true) else {
+      return .cancelled(
+        CommandResult(
+          status: -128, stdout: "",
+          stderr: text(
+            language,
+            "Helper update authentication was cancelled; no control action was sent.",
+            "已取消 helper 升级认证，未发送任何控制操作。")))
+    }
+
+    do {
+      try await service.unregister()
+      clearRecordedHelperRegistration()
+      guard await waitForPrivilegedHelperUnregistration() else {
+        return .ready(
+          mode: .administratorPrompt,
+          migrationNotice: text(
+            language,
+            "The old passwordless helper did not finish unregistering. This action used administrator-password authorization; no new helper was registered yet.",
+            "旧版免密码 helper 未完成注销；本次改用管理员密码授权，且尚未注册新 helper。"))
+      }
+      let replacementService = SMAppService.daemon(
+        plistName: PrivilegedHelperConfiguration.daemonPlistName)
+      try replacementService.register()
+      recordCurrentHelperRegistration()
+    } catch {
+      clearRecordedHelperRegistration()
+      return .ready(
+        mode: .administratorPrompt,
+        migrationNotice: text(
+          language,
+          "The passwordless helper update failed; this action used administrator-password authorization instead. \(error.localizedDescription)",
+          "免密码 helper 升级失败，本次改用管理员密码授权。\(error.localizedDescription)"))
+    }
+
+    let migratedMode = privilegedExecutionMode()
+    let notice =
+      migratedMode == .xpc
+      ? text(
+        language,
+        "The passwordless helper was registered for this app build and is being verified before use.",
+        "已为当前 App 构建注册免密码 helper，使用前正在验证。")
+      : text(
+        language,
+        "The updated helper is waiting for approval in System Settings; this action used administrator-password authorization.",
+        "新版 helper 正等待在系统设置中批准，本次改用管理员密码授权。")
+    return .ready(mode: migratedMode, migrationNotice: notice)
   }
 
   func refresh() {
@@ -323,10 +593,16 @@ private final class ServiceController: ObservableObject {
     Task {
       let result = await Self.run(
         helperURL, arguments: ["status"],
-        environment: ["CORPLINK_CONTROL_LANG": language.helperCode])
+        environment: ["CORPLINK_CONTROL_LANG": language.helperCode], timeout: 15)
       guard requestID == statusRequestID else { return }
-      if !isBusy {
+      if !isBusy, result.status != 124 {
         applyStatus(result)
+      } else if !isBusy {
+        showMessage(
+          text(
+            language, "Status refresh timed out. The displayed state was left unchanged.",
+            "状态刷新超时，当前显示状态未被更改。"),
+          error: true)
       }
       isFetchingStatus = false
     }
@@ -339,34 +615,96 @@ private final class ServiceController: ObservableObject {
     isBusy = true
     message = nil
     isWarning = false
+    progressMessage = text(language, "Preparing the control request…", "正在准备控制请求…")
     Task {
+      defer {
+        progressMessage = nil
+        isBusy = false
+      }
       guard PrivilegedHelperConfiguration.allowedActions.contains(action) else {
         showMessage(text(language, "Unsupported control action.", "不支持的控制操作。"), error: true)
-        isBusy = false
         return
       }
-      let executionMode = privilegedExecutionMode()
+      let preparation = await preparePrivilegedExecution(
+        helperURL: helperURL, language: language)
+      let executionMode: PrivilegedExecutionMode
+      let migrationNotice: String?
+      switch preparation {
+      case .ready(let mode, let notice):
+        executionMode = mode
+        migrationNotice = notice
+      case .cancelled(let cancellation):
+        showMessage(cancellation.stderr, error: true)
+        return
+      }
       let shouldDisconnect =
         action == "stop" || action == "stop-suite"
         || action == "stop-component:connection"
       let currentLanguage = language
+      if shouldDisconnect {
+        progressMessage = text(
+          currentLanguage, "Disconnecting active VPN and SWG sessions…", "正在断开 VPN 和 SWG 会话…")
+      }
       let disconnectSummary =
         shouldDisconnect ? await Self.disconnectNetworkSessions(language: currentLanguage) : nil
+      progressMessage = operationProgressText(action, language: currentLanguage)
       let result: CommandResult
+      var executionNotice: String?
+      var shouldRefreshStatus = true
       switch executionMode {
       case .xpc:
-        result = await Self.runWithPrivilegedHelper(
+        let attempt = await Self.runWithPrivilegedHelper(
           helperURL: helperURL, action: action, language: currentLanguage)
+        switch attempt {
+        case .completed(let helperResult):
+          result = helperResult
+          if migrationNotice != nil {
+            executionNotice = text(
+              currentLanguage,
+              "The passwordless helper was updated and verified for this app build.",
+              "免密码 helper 已迁移并通过当前 App 构建验证。")
+          }
+        case .fallbackAllowed:
+          clearRecordedHelperRegistration()
+          executionNotice = text(
+            currentLanguage,
+            "The registered passwordless helper did not pass its health check; this action used administrator-password authorization.",
+            "已注册的免密码 helper 未通过健康检查；本次改用管理员密码授权。")
+          progressMessage = text(
+            currentLanguage,
+            "The passwordless helper is unavailable; waiting for administrator authorization…",
+            "免密码 helper 不可用，正在等待管理员授权…")
+          result = await Self.runWithAdministratorPrivileges(
+            helperURL, action: action, language: currentLanguage)
+        case .deliveryUncertain(let helperResult):
+          shouldRefreshStatus = false
+          let guidance = text(
+            currentLanguage,
+            "The request may have reached the privileged helper, so it was not repeated "
+              + "automatically. Refresh status first. To retry with an administrator password, "
+              + "turn off Passwordless start and stop and try again.",
+            "请求可能已经送达特权 helper，因此没有自动重复执行。请先刷新状态；"
+              + "如需改用管理员密码重试，请关闭“免密码启停”后再次操作。")
+          let detail = helperResult.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+          result = CommandResult(
+            status: helperResult.status,
+            stdout: helperResult.stdout,
+            stderr: detail.isEmpty ? guidance : "\(detail)\n\(guidance)")
+        }
       case .administratorPrompt:
+        progressMessage = text(
+          currentLanguage, "Waiting for administrator authorization…", "正在等待管理员授权…")
         result = await Self.runWithAdministratorPrivileges(
           helperURL, action: action, language: currentLanguage)
       }
+      let operationNotice = executionNotice ?? migrationNotice
       if result.status == 0 {
         let outputText = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         let warning = outputText.split(separator: "\n").contains { line in
           line.hasPrefix("Warning:") || line.hasPrefix("提示：")
         }
         let parts = [
+          operationNotice,
           disconnectSummary,
           outputText.isEmpty
             ? text(currentLanguage, "Operation completed successfully", "操作成功") : outputText,
@@ -383,21 +721,60 @@ private final class ServiceController: ObservableObject {
               ? text(currentLanguage, "Operation failed", "操作失败")
               : cleanAdministratorError(detail)),
           error: true)
+        if let operationNotice {
+          message = [operationNotice, message].compactMap { $0 }.joined(separator: "\n")
+        }
       }
-      let statusResult = await Self.run(
-        helperURL, arguments: ["status"],
-        environment: ["CORPLINK_CONTROL_LANG": currentLanguage.helperCode])
-      applyStatus(statusResult)
-      isBusy = false
+      if shouldRefreshStatus {
+        progressMessage = text(
+          currentLanguage, "Verifying the live Corplink state…", "正在验证飞连实时状态…")
+        let statusResult = await Self.run(
+          helperURL, arguments: ["status"],
+          environment: ["CORPLINK_CONTROL_LANG": currentLanguage.helperCode], timeout: 15)
+        if statusResult.status != 124 {
+          applyStatus(statusResult)
+        } else {
+          let warning = text(
+            currentLanguage,
+            "The operation returned, but status refresh timed out. Refresh status again before another control action.",
+            "操作已返回，但状态刷新超时。再次控制前请重新刷新状态。")
+          message = [message, warning].compactMap { $0 }.joined(separator: "\n")
+          isWarning = true
+        }
+      }
     }
   }
 
+  private func operationProgressText(_ action: String, language: AppLanguage) -> String {
+    if action == "stop-suite" {
+      return text(
+        language,
+        "Stopping all Corplink components and checking for restarts…",
+        "正在停止所有飞连组件并检查是否复活…")
+    }
+    if action == "start-suite" {
+      return text(language, "Starting and verifying all Corplink components…", "正在启动并验证所有飞连组件…")
+    }
+    if action.hasPrefix("stop") {
+      return text(language, "Stopping and verifying the component…", "正在停止并验证组件…")
+    }
+    return text(language, "Starting and verifying the component…", "正在启动并验证组件…")
+  }
+
   private func applyStatus(_ result: CommandResult) {
-    let values = Dictionary(
-      uniqueKeysWithValues: result.stdout.split(separator: "\n").compactMap { row in
-        let pair = row.split(separator: "=", maxSplits: 1).map(String.init)
-        return pair.count == 2 ? (pair[0], pair[1]) : nil
-      })
+    let report: HelperStatusReport
+    do {
+      report = try HelperStatusReport.parse(exitStatus: result.status, output: result.stdout)
+    } catch {
+      showMessage(
+        text(
+          language,
+          "The helper returned an invalid status report. The displayed state was left unchanged. \(error)",
+          "helper 返回了无效状态报告，当前显示状态未更改。\(error)"),
+        error: true)
+      return
+    }
+    let values = report.values
     components = ComponentStatus.definitions.map { definition in
       var component = definition
       let fields = (values["job.\(definition.id)"] ?? "").split(
@@ -466,8 +843,9 @@ private final class ServiceController: ObservableObject {
         "未找到 corplink-cli，跳过 VPN/SWG 主动断开步骤。")
     }
 
-    let vpnResult = await run(cliURL, arguments: ["vpn", "disconnect"])
-    let swgResult = await run(cliURL, arguments: ["swg", "disconnect"])
+    async let vpnRequest = run(cliURL, arguments: ["vpn", "disconnect"], timeout: 5)
+    async let swgRequest = run(cliURL, arguments: ["swg", "disconnect"], timeout: 5)
+    let (vpnResult, swgResult) = await (vpnRequest, swgRequest)
     let vpnText =
       vpnResult.status == 0
       ? text(language, "VPN disconnected", "VPN 已主动断开")
@@ -480,45 +858,26 @@ private final class ServiceController: ObservableObject {
   }
 
   nonisolated private static func run(
-    _ executable: URL, arguments: [String], environment: [String: String] = [:]
+    _ executable: URL, arguments: [String], environment: [String: String] = [:],
+    timeout: TimeInterval? = nil
   ) async -> CommandResult
   {
-    await Task.detached {
-      let process = Process()
-      let stdoutPipe = Pipe()
-      let stderrPipe = Pipe()
-      process.executableURL = executable
-      process.arguments = arguments
-      if !environment.isEmpty {
-        process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
-      }
-      process.standardOutput = stdoutPipe
-      process.standardError = stderrPipe
-      do {
-        try process.run()
-        process.waitUntilExit()
-      } catch {
-        return CommandResult(status: 127, stdout: "", stderr: error.localizedDescription)
-      }
-      return CommandResult(
-        status: process.terminationStatus,
-        stdout: String(
-          decoding: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
-        stderr: String(
-          decoding: stderrPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-      )
-    }.value
+    await runProcess(
+      executable, arguments: arguments, environment: environment, timeout: timeout)
   }
 
   nonisolated private static func runWithPrivilegedHelper(
     helperURL: URL, action: String, language: AppLanguage
-  ) async -> CommandResult {
+  ) async -> PrivilegedHelperAttempt {
     guard
-      let helperRequirement = PrivilegedHelperConfiguration.designatedRequirement(at: helperURL)
+      let helperRequirement = PrivilegedHelperConfiguration.designatedRequirement(at: helperURL),
+      let expectedBundleVersion = Bundle.main.object(
+        forInfoDictionaryKey: "CFBundleVersion") as? String
     else {
-      return CommandResult(
-        status: 78, stdout: "",
-        stderr: "The privileged helper does not have a valid designated requirement.")
+      return .fallbackAllowed(
+        CommandResult(
+          status: 78, stdout: "",
+          stderr: "The privileged helper does not have a valid designated requirement."))
     }
     return await withCheckedContinuation { continuation in
       let connection = NSXPCConnection(
@@ -530,7 +889,8 @@ private final class ServiceController: ObservableObject {
 
       let lock = NSLock()
       var completed = false
-      func finish(_ result: CommandResult) {
+      var requestSubmitted = false
+      func finish(_ attempt: PrivilegedHelperAttempt) {
         lock.lock()
         guard !completed else {
           lock.unlock()
@@ -539,17 +899,41 @@ private final class ServiceController: ObservableObject {
         completed = true
         lock.unlock()
         connection.invalidate()
-        continuation.resume(returning: result)
+        continuation.resume(returning: attempt)
+      }
+
+      func finishTransportFailure(_ result: CommandResult) {
+        lock.lock()
+        guard !completed else {
+          lock.unlock()
+          return
+        }
+        let attempt: PrivilegedHelperAttempt =
+          PrivilegedHelperConfiguration.canFallbackAfterTransportFailure(
+            requestSubmitted: requestSubmitted)
+          ? .fallbackAllowed(result) : .deliveryUncertain(result)
+        completed = true
+        lock.unlock()
+        connection.invalidate()
+        continuation.resume(returning: attempt)
+      }
+
+      func markRequestSubmitted() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !completed else { return false }
+        requestSubmitted = true
+        return true
       }
 
       connection.interruptionHandler = {
-        finish(
+        finishTransportFailure(
           CommandResult(
             status: 70, stdout: "",
             stderr: "The privileged helper connection was interrupted."))
       }
       connection.invalidationHandler = {
-        finish(
+        finishTransportFailure(
           CommandResult(
             status: 70, stdout: "",
             stderr: "The privileged helper connection became invalid."))
@@ -558,16 +942,55 @@ private final class ServiceController: ObservableObject {
 
       guard
         let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
-          finish(CommandResult(status: 70, stdout: "", stderr: error.localizedDescription))
+          finishTransportFailure(
+            CommandResult(status: 70, stdout: "", stderr: error.localizedDescription))
         }) as? CorplinkPrivilegedHelperProtocol
       else {
-        finish(
+        finishTransportFailure(
           CommandResult(
             status: 70, stdout: "", stderr: "The privileged helper proxy is unavailable."))
         return
       }
-      proxy.perform(action: action, language: language.helperCode) { status, stdout, stderr in
-        finish(CommandResult(status: status.int32Value, stdout: stdout, stderr: stderr))
+
+      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) {
+        lock.lock()
+        let stillProbing = !completed && !requestSubmitted
+        lock.unlock()
+        if stillProbing {
+          finishTransportFailure(
+            CommandResult(
+              status: 124, stdout: "",
+              stderr: "The privileged helper did not answer its health probe."))
+        }
+      }
+
+      proxy.probe { protocolVersion, bundleVersion in
+        guard
+          PrivilegedHelperConfiguration.isCompatibleProbe(
+            protocolVersion: protocolVersion.intValue,
+            bundleVersion: bundleVersion,
+            expectedBundleVersion: expectedBundleVersion)
+        else {
+          finish(
+            .fallbackAllowed(
+              CommandResult(
+                status: 78, stdout: "",
+                stderr:
+                  "The registered privileged helper did not match this app build or protocol.")))
+          return
+        }
+        guard markRequestSubmitted() else { return }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 60) {
+          finishTransportFailure(
+            CommandResult(
+              status: 124, stdout: "",
+              stderr: "The privileged helper did not reply before the operation timeout."))
+        }
+        proxy.perform(action: action, language: language.helperCode) { status, stdout, stderr in
+          finish(
+            .completed(
+              CommandResult(status: status.int32Value, stdout: stdout, stderr: stderr)))
+        }
       }
     }
   }
@@ -581,7 +1004,8 @@ private final class ServiceController: ObservableObject {
     let command =
       "CORPLINK_CONTROL_LANG=\(shellQuote(language.helperCode)) \(shellQuote(helper.path)) \(shellQuote(action))"
     let script = "do shell script \"\(appleScriptEscape(command))\" with administrator privileges"
-    return await run(URL(fileURLWithPath: "/usr/bin/osascript"), arguments: ["-e", script])
+    return await run(
+      URL(fileURLWithPath: "/usr/bin/osascript"), arguments: ["-e", script], timeout: 180)
   }
 
   nonisolated private static func shellQuote(_ value: String) -> String {
@@ -627,10 +1051,11 @@ private enum SidebarItem: String, CaseIterable, Identifiable {
 @MainActor
 private final class PrivilegedHelperController: ObservableObject {
   private enum Status: Equatable {
-    case checking, enabled, requiresApproval, notRegistered, notFound, unknown
+    case checking, enabled, updateRequired, requiresApproval, notRegistered, notFound, unknown
   }
 
   @Published var isEnabled = false
+  @Published var isChanging = false
   @Published private var status: Status = .checking
   @Published var errorMessage: String?
 
@@ -646,10 +1071,10 @@ private final class PrivilegedHelperController: ObservableObject {
     switch service.status {
     case .enabled:
       isEnabled = true
-      status = .enabled
+      status = registeredHelperMatchesCurrentBuild() ? .enabled : .updateRequired
     case .requiresApproval:
       isEnabled = true
-      status = .requiresApproval
+      status = registeredHelperMatchesCurrentBuild() ? .requiresApproval : .updateRequired
     case .notRegistered:
       isEnabled = false
       status = .notRegistered
@@ -663,9 +1088,14 @@ private final class PrivilegedHelperController: ObservableObject {
   }
 
   func statusText(_ language: AppLanguage) -> String {
+    if isChanging { return text(language, "Authenticating…", "正在验证身份…") }
     switch status {
     case .checking: return text(language, "Checking…", "正在检查…")
     case .enabled: return text(language, "Enabled", "已启用")
+    case .updateRequired:
+      return text(
+        language, "Update required before the next passwordless action",
+        "下次免密码操作前需要升级 helper")
     case .requiresApproval:
       return text(language, "Waiting for approval in System Settings", "等待在系统设置中批准")
     case .notRegistered: return text(language, "Not enabled", "未启用")
@@ -677,6 +1107,7 @@ private final class PrivilegedHelperController: ObservableObject {
   var requiresApproval: Bool { status == .requiresApproval }
 
   func setEnabled(_ enabled: Bool, language: AppLanguage) {
+    guard !isChanging else { return }
     errorMessage = nil
     if enabled {
       let appURL = Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL
@@ -708,13 +1139,54 @@ private final class PrivilegedHelperController: ObservableObject {
         refresh()
         return
       }
+      guard currentProcessIsAdministrator() else {
+        errorMessage = text(
+          language,
+          "Only the foreground administrator account can enable passwordless control.",
+          "只有当前前台管理员账户可以开启免密码控制。")
+        refresh()
+        return
+      }
+      isChanging = true
+      Task {
+        defer { isChanging = false }
+        guard await authenticateHelperRegistration(language) else {
+          errorMessage = text(
+            language, "Administrator authentication was cancelled or failed.",
+            "管理员身份验证已取消或失败。")
+          refresh()
+          return
+        }
+        await updateRegistration(enabled: true, language: language)
+      }
+      return
     }
 
+    isChanging = true
+    Task {
+      defer { isChanging = false }
+      await updateRegistration(enabled: false, language: language)
+    }
+  }
+
+  private func updateRegistration(enabled: Bool, language: AppLanguage) async {
     do {
       if enabled {
-        try service.register()
+        let registrationService = SMAppService.daemon(
+          plistName: PrivilegedHelperConfiguration.daemonPlistName)
+        try registrationService.register()
+        recordCurrentHelperRegistration()
       } else {
-        try service.unregister()
+        try await service.unregister()
+        clearRecordedHelperRegistration()
+        guard await waitForPrivilegedHelperUnregistration() else {
+          refresh()
+          errorMessage = text(
+            language,
+            "macOS did not finish unregistering the privileged helper before the timeout. Passwordless actions remain disabled in this app; refresh the status before trying again.",
+            "macOS 未在超时前完成特权 helper 注销。本 App 已禁用免密码操作；请刷新状态后再试。")
+          return
+        }
       }
     } catch {
       refresh()
@@ -913,7 +1385,7 @@ private struct StatusCard: View {
 
       VStack(alignment: .leading, spacing: 5) {
         Text(controller.suiteTitle).font(.title3.bold())
-        Text(controller.suiteDetail)
+        Text(controller.progressMessage ?? controller.suiteDetail)
           .font(.callout)
           .foregroundStyle(.secondary)
       }
@@ -1298,6 +1770,7 @@ private struct SettingsView: View {
                 }
               )
             )
+            .disabled(privilegedHelperController.isChanging)
             Text(
               "\(text(controller.language, "Current status", "当前状态")): \(privilegedHelperController.statusText(controller.language))")
               .font(.caption)
@@ -1305,8 +1778,11 @@ private struct SettingsView: View {
             Text(
               text(
                 controller.language,
-                "When off, macOS asks for an administrator password for each control action. When on, one explicit macOS approval registers the signed root helper. Only fixed Corplink actions from this exact signed app are accepted.",
-                "关闭时，每次控制操作仍由 macOS 要求输入管理员密码；开启后，经 macOS 明确批准一次即可注册已签名的 root helper。两种方式都只接受固定的飞连操作。"))
+                "Off: each action requires an administrator password. On: after macOS approval, "
+                  + "the foreground administrator can start or stop without repeated prompts. "
+                  + "Re-enabling or upgrading requires authentication again.",
+                "关闭时，每次操作需输入管理员密码；开启并经系统批准后，当前前台管理员可免密启停。"
+                  + "重新开启或升级时需再次验证。"))
               .font(.caption)
               .foregroundStyle(.secondary)
 

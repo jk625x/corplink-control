@@ -18,12 +18,24 @@ set -e
 echo "$status_output"
 echo
 
+runtime_stopped=$(printf '%s\n' "$status_output" | awk -F= '/^suite_runtime_stopped=/{print $2}')
+suite_clean=$(printf '%s\n' "$status_output" | awk -F= '/^suite_clean=/{print $2}')
+
 case "$status_code" in
   0)
-    echo "[i] At least one Corplink component is running. See job.* above for details."
+    if [[ "$runtime_stopped" == "true" ]]; then
+      echo "[ok] Corplink runtime is stopped; a known System Extension remains enabled."
+    else
+      echo "[i] At least one Corplink component is running. See job.* above for details."
+    fi
     ;;
   3)
-    echo "[ok] No known Corplink job, process, or active System Extension was detected."
+    if [[ "$runtime_stopped" == "true" && "$suite_clean" == "true" ]]; then
+      echo "[ok] No known Corplink job, process, or active System Extension was detected."
+    else
+      echo "[x] Helper exit code and status fields disagree." >&2
+      exit 1
+    fi
     ;;
   1)
     echo "[x] At least one resident launchd job disagrees with its expected process state." >&2
