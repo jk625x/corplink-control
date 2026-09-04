@@ -20,6 +20,7 @@ The app opens in English by default and can be switched to Simplified Chinese in
 - A snow-themed anime app icon and a lightweight snowflake menu bar indicator with distinct running, stopped, checking, and inconsistent states.
 - A setting that decides whether closing the main window keeps the app running in the background or quits the entire app.
 - Optional launch at login.
+- Optional passwordless Start and Stop after one explicit macOS approval; the administrator-password prompt remains the default and fallback.
 - English and Simplified Chinese interfaces; English is the default.
 
 Status refreshes silently every 30 seconds only while the main window is visible and the app is active. Closing, minimizing, or putting the app in the background stops automatic status scans, keeping idle resource use low.
@@ -73,6 +74,10 @@ Requirements: macOS 13 or newer and the Swift toolchain included with Xcode Comm
 ./build-app.sh
 ```
 
-The universal app is created at `dist/Corplink Control.app`. Reading status does not require elevated privileges. macOS asks for administrator authorization only when a component is started or stopped.
+The universal app is created at `dist/Corplink Control.app`. Reading status does not require elevated privileges. By default, starting or stopping uses the standard macOS administrator-password prompt. Passwordless control is optional and must be explicitly enabled under **Settings > Privileged control > Passwordless start and stop**. Enabling it registers an embedded `SMAppService` LaunchDaemon and requires one administrator approval under **System Settings > General > Login Items & Extensions**. After approval, control actions use a code-signature-checked XPC connection without asking for the password each time. While the option is off or still awaiting approval, the normal password prompt remains available as a fallback.
 
-The current release uses AppleScript's administrator authorization flow, which is suitable for personal distribution. A larger public distribution should use Developer ID signing, notarization, and a ServiceManagement privileged helper.
+For reliable LaunchDaemon startup, keep the app in `/Applications`. Both XPC peers enforce the exact designated requirement read from the signed app bundle, including the exact cdhash for local ad-hoc builds. The helper accepts only fixed action names, checks the console user, serializes privileged operations, and runs those actions in-process rather than executing a replaceable helper path. Builds use Hardened Runtime. Public distribution should additionally use Developer ID signing and notarization; set `CORPLINK_CODE_SIGN_IDENTITY` to the signing identity when building.
+
+When testing a local build, quit Corplink Control, replace the existing `/Applications/Corplink Control.app` with the newly built app, and launch that installed copy. The app deliberately refuses to register its privileged helper while running from Downloads, the build directory, or another location. Confirm that the About page reports version 1.6.0 before testing helper approval. Then enable **Settings > Privileged control > Passwordless start and stop**; control buttons never register the helper implicitly, and they continue to work through the password prompt when the option is off.
+
+See [Privileged helper architecture, security, fallback, and cleanup](docs/PRIVILEGED-HELPER.md) for the complete trust model and lifecycle.

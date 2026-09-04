@@ -194,6 +194,11 @@ private struct CommandResult {
   let stderr: String
 }
 
+private enum PrivilegedExecutionMode {
+  case xpc
+  case administratorPrompt
+}
+
 @MainActor
 private final class ServiceController: ObservableObject {
   @Published var language: AppLanguage {
@@ -283,7 +288,24 @@ private final class ServiceController: ObservableObject {
   }
 
   private var helperURL: URL? {
-    Bundle.main.url(forResource: "corplink-root-helper", withExtension: nil)
+    guard let resourcesURL = Bundle.main.resourceURL else { return nil }
+    let url = resourcesURL.appendingPathComponent("corplink-root-helper", isDirectory: false)
+    return FileManager.default.isExecutableFile(atPath: url.path) ? url : nil
+  }
+
+  private func privilegedExecutionMode() -> PrivilegedExecutionMode {
+    let service = SMAppService.daemon(
+      plistName: PrivilegedHelperConfiguration.daemonPlistName)
+    guard service.status == .enabled else { return .administratorPrompt }
+
+    let appURL = Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL
+    let applicationsURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+      .resolvingSymlinksInPath().standardizedFileURL
+    guard
+      appURL.deletingLastPathComponent() == applicationsURL,
+      PrivilegedHelperConfiguration.designatedRequirement(at: appURL) != nil
+    else { return .administratorPrompt }
+    return .xpc
   }
 
   func refresh() {
@@ -318,14 +340,27 @@ private final class ServiceController: ObservableObject {
     message = nil
     isWarning = false
     Task {
+      guard PrivilegedHelperConfiguration.allowedActions.contains(action) else {
+        showMessage(text(language, "Unsupported control action.", "不支持的控制操作。"), error: true)
+        isBusy = false
+        return
+      }
+      let executionMode = privilegedExecutionMode()
       let shouldDisconnect =
         action == "stop" || action == "stop-suite"
         || action == "stop-component:connection"
       let currentLanguage = language
       let disconnectSummary =
         shouldDisconnect ? await Self.disconnectNetworkSessions(language: currentLanguage) : nil
-      let result = await Self.runWithAdministratorPrivileges(
-        helperURL, action: action, language: currentLanguage)
+      let result: CommandResult
+      switch executionMode {
+      case .xpc:
+        result = await Self.runWithPrivilegedHelper(
+          helperURL: helperURL, action: action, language: currentLanguage)
+      case .administratorPrompt:
+        result = await Self.runWithAdministratorPrivileges(
+          helperURL, action: action, language: currentLanguage)
+      }
       if result.status == 0 {
         let outputText = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         let warning = outputText.split(separator: "\n").contains { line in
@@ -475,11 +510,74 @@ private final class ServiceController: ObservableObject {
     }.value
   }
 
+  nonisolated private static func runWithPrivilegedHelper(
+    helperURL: URL, action: String, language: AppLanguage
+  ) async -> CommandResult {
+    guard
+      let helperRequirement = PrivilegedHelperConfiguration.designatedRequirement(at: helperURL)
+    else {
+      return CommandResult(
+        status: 78, stdout: "",
+        stderr: "The privileged helper does not have a valid designated requirement.")
+    }
+    return await withCheckedContinuation { continuation in
+      let connection = NSXPCConnection(
+        machServiceName: PrivilegedHelperConfiguration.machServiceName,
+        options: .privileged)
+      connection.remoteObjectInterface = NSXPCInterface(
+        with: CorplinkPrivilegedHelperProtocol.self)
+      connection.setCodeSigningRequirement(helperRequirement)
+
+      let lock = NSLock()
+      var completed = false
+      func finish(_ result: CommandResult) {
+        lock.lock()
+        guard !completed else {
+          lock.unlock()
+          return
+        }
+        completed = true
+        lock.unlock()
+        connection.invalidate()
+        continuation.resume(returning: result)
+      }
+
+      connection.interruptionHandler = {
+        finish(
+          CommandResult(
+            status: 70, stdout: "",
+            stderr: "The privileged helper connection was interrupted."))
+      }
+      connection.invalidationHandler = {
+        finish(
+          CommandResult(
+            status: 70, stdout: "",
+            stderr: "The privileged helper connection became invalid."))
+      }
+      connection.activate()
+
+      guard
+        let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
+          finish(CommandResult(status: 70, stdout: "", stderr: error.localizedDescription))
+        }) as? CorplinkPrivilegedHelperProtocol
+      else {
+        finish(
+          CommandResult(
+            status: 70, stdout: "", stderr: "The privileged helper proxy is unavailable."))
+        return
+      }
+      proxy.perform(action: action, language: language.helperCode) { status, stdout, stderr in
+        finish(CommandResult(status: status.int32Value, stdout: stdout, stderr: stderr))
+      }
+    }
+  }
+
   nonisolated private static func runWithAdministratorPrivileges(
     _ helper: URL, action: String, language: AppLanguage
-  )
-    async -> CommandResult
-  {
+  ) async -> CommandResult {
+    guard PrivilegedHelperConfiguration.allowedActions.contains(action) else {
+      return CommandResult(status: 64, stdout: "", stderr: "Unsupported control action.")
+    }
     let command =
       "CORPLINK_CONTROL_LANG=\(shellQuote(language.helperCode)) \(shellQuote(helper.path)) \(shellQuote(action))"
     let script = "do shell script \"\(appleScriptEscape(command))\" with administrator privileges"
@@ -523,6 +621,112 @@ private enum SidebarItem: String, CaseIterable, Identifiable {
     case .settings: return "gearshape"
     case .about: return "app.badge"
     }
+  }
+}
+
+@MainActor
+private final class PrivilegedHelperController: ObservableObject {
+  private enum Status: Equatable {
+    case checking, enabled, requiresApproval, notRegistered, notFound, unknown
+  }
+
+  @Published var isEnabled = false
+  @Published private var status: Status = .checking
+  @Published var errorMessage: String?
+
+  private var service: SMAppService {
+    SMAppService.daemon(plistName: PrivilegedHelperConfiguration.daemonPlistName)
+  }
+
+  init() {
+    refresh()
+  }
+
+  func refresh() {
+    switch service.status {
+    case .enabled:
+      isEnabled = true
+      status = .enabled
+    case .requiresApproval:
+      isEnabled = true
+      status = .requiresApproval
+    case .notRegistered:
+      isEnabled = false
+      status = .notRegistered
+    case .notFound:
+      isEnabled = false
+      status = .notFound
+    @unknown default:
+      isEnabled = false
+      status = .unknown
+    }
+  }
+
+  func statusText(_ language: AppLanguage) -> String {
+    switch status {
+    case .checking: return text(language, "Checking…", "正在检查…")
+    case .enabled: return text(language, "Enabled", "已启用")
+    case .requiresApproval:
+      return text(language, "Waiting for approval in System Settings", "等待在系统设置中批准")
+    case .notRegistered: return text(language, "Not enabled", "未启用")
+    case .notFound: return text(language, "Helper not found in this app", "当前 App 中找不到 helper")
+    case .unknown: return text(language, "Unknown status", "未知状态")
+    }
+  }
+
+  var requiresApproval: Bool { status == .requiresApproval }
+
+  func setEnabled(_ enabled: Bool, language: AppLanguage) {
+    errorMessage = nil
+    if enabled {
+      let appURL = Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL
+      let applicationsURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        .resolvingSymlinksInPath().standardizedFileURL
+      guard appURL.deletingLastPathComponent() == applicationsURL else {
+        errorMessage = text(
+          language,
+          "Move this app to /Applications and replace the old copy before enabling passwordless control.",
+          "请先把当前 App 移到 /Applications 并替换旧版本，再开启免密码控制。")
+        refresh()
+        return
+      }
+      let helperURL = appURL.appendingPathComponent(
+        "Contents/Resources/corplink-root-helper", isDirectory: false)
+      let daemonPlistURL = appURL.appendingPathComponent(
+        "Contents/Library/LaunchDaemons/\(PrivilegedHelperConfiguration.daemonPlistName)",
+        isDirectory: false)
+      guard
+        FileManager.default.isExecutableFile(atPath: helperURL.path),
+        FileManager.default.fileExists(atPath: daemonPlistURL.path),
+        PrivilegedHelperConfiguration.designatedRequirement(at: appURL) != nil,
+        PrivilegedHelperConfiguration.designatedRequirement(at: helperURL) != nil
+      else {
+        errorMessage = text(
+          language,
+          "This app copy is incomplete or its signature is invalid. Install a fresh build.",
+          "当前 App 不完整或签名无效，请安装一份新的构建。")
+        refresh()
+        return
+      }
+    }
+
+    do {
+      if enabled {
+        try service.register()
+      } else {
+        try service.unregister()
+      }
+    } catch {
+      refresh()
+      let expectedState = enabled ? (status == .enabled || status == .requiresApproval) : false
+      if !expectedState { errorMessage = error.localizedDescription }
+      return
+    }
+    refresh()
+  }
+
+  func openSystemSettings() {
+    SMAppService.openSystemSettingsLoginItems()
   }
 }
 
@@ -1026,6 +1230,7 @@ private struct SettingsView: View {
   @ObservedObject var controller: ServiceController
   @AppStorage("showMenuBarItem") private var showMenuBarItem = true
   @AppStorage(AppConstants.keepRunningKey) private var keepRunningAfterWindowClose = true
+  @StateObject private var privilegedHelperController = PrivilegedHelperController()
   @StateObject private var loginController = LaunchAtLoginController()
 
   var body: some View {
@@ -1082,6 +1287,46 @@ private struct SettingsView: View {
           .padding(8)
         }
 
+        GroupBox(text(controller.language, "Privileged control", "特权控制")) {
+          VStack(alignment: .leading, spacing: 10) {
+            Toggle(
+              text(controller.language, "Passwordless start and stop", "免密码启停"),
+              isOn: Binding(
+                get: { privilegedHelperController.isEnabled },
+                set: {
+                  privilegedHelperController.setEnabled($0, language: controller.language)
+                }
+              )
+            )
+            Text(
+              "\(text(controller.language, "Current status", "当前状态")): \(privilegedHelperController.statusText(controller.language))")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+            Text(
+              text(
+                controller.language,
+                "When off, macOS asks for an administrator password for each control action. When on, one explicit macOS approval registers the signed root helper. Only fixed Corplink actions from this exact signed app are accepted.",
+                "关闭时，每次控制操作仍由 macOS 要求输入管理员密码；开启后，经 macOS 明确批准一次即可注册已签名的 root helper。两种方式都只接受固定的飞连操作。"))
+              .font(.caption)
+              .foregroundStyle(.secondary)
+
+            HStack {
+              if privilegedHelperController.requiresApproval {
+                Button(text(controller.language, "Open Approval Settings", "打开批准设置")) {
+                  privilegedHelperController.openSystemSettings()
+                }
+              }
+              Button(text(controller.language, "Refresh Status", "刷新状态")) {
+                privilegedHelperController.refresh()
+              }
+            }
+            if let error = privilegedHelperController.errorMessage {
+              Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+            }
+          }
+          .padding(8)
+        }
+
         GroupBox(text(controller.language, "Login item", "登录项")) {
           VStack(alignment: .leading, spacing: 10) {
             Toggle(
@@ -1117,6 +1362,10 @@ private struct SettingsView: View {
       }
       .padding(28)
       .frame(maxWidth: 720, alignment: .leading)
+    }
+    .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) {
+      _ in
+      privilegedHelperController.refresh()
     }
   }
 }
