@@ -34,11 +34,11 @@ The vendor's `/usr/local/corplink/uninstall.sh` removes extensions, jobs, and fi
 1. Requests an active VPN disconnect through `corplink-cli vpn disconnect`.
 2. Requests an active Secure Web Gateway disconnect through `corplink-cli swg disconnect`.
 3. Saves recovery data needed for the client login plist, without using that snapshot to restrict the next suite-wide Start.
-4. Stops user-level client, agent, and application-control jobs before system-level connection, policy, monitoring, and protection jobs.
+4. Stops user-level client, agent, and application-control jobs as one bounded batch before stopping the independent system-level connection, policy, monitoring, and protection jobs as a second batch.
 5. Uses `launchctl bootout` with each job's exact `system` or `gui/<uid>` domain.
 6. If a process remains after its job is unloaded, sends `SIGTERM`, waits two seconds, then uses `SIGKILL` only for a still-matching orphan.
 7. Temporarily removes only the `schg` or `uchg` flags actually present on a plist and restores the identical flag set after the operation.
-8. Observes the machine for five seconds. Any known job or process that returns makes the operation fail.
+8. Requires five uninterrupted seconds with no known job or process. If a job or process returns, Stop performs one bounded convergence retry and fails if residue remains.
 9. Reports known active Corplink System Extensions as a warning. The app does not uninstall them because that would change a reversible stop into an uninstall.
 
 A suite stop is reported as clean only when all installed known jobs are unloaded, their matching processes are absent, matching Finder Sync or SealSuite auxiliary processes are absent, and no known Corplink System Extension is active. If jobs and processes are gone but an extension remains enabled, the operation succeeds as a **runtime stop with a warning**. Plists, application files, and System Extensions remain because Stop is not Uninstall.
@@ -68,9 +68,23 @@ Its exit codes are:
 
 | Code | Meaning |
 | --- | --- |
-| `0` | At least part of the suite is running and resident job/process state is consistent |
+| `0` | The report is internally consistent; inspect `suite_runtime_stopped` to distinguish a running suite from a successful runtime stop with only a System Extension left enabled |
 | `3` | No known job, process, auxiliary process, or active known extension remains |
 | `1` | A resident job and its expected process disagree |
+| `70` | A required inspection command failed or timed out, so no status conclusion can be drawn |
+
+## Live verification on 2026-09-04
+
+Environment: macOS 27.0 (26A5416b), CorpLink 3.3.15.12440, and an ad-hoc-signed universal Corplink Control 1.6.1 build 11 installed in `/Applications`.
+
+| Check | Observed result |
+| --- | --- |
+| Passwordless Start | The build/protocol probe passed before submission; 8 of 8 jobs and 15 related processes were running, with no administrator-password `osascript` process |
+| Passwordless Stop | The UI completed in about 33 seconds including the five-second stable-state watch; the immediate audit reported 0 of 8 loaded jobs and 0 known processes |
+| Relaunch observation | The built-in uninterrupted five-second watch passed; additional audits about 44 and 66 seconds after a repeated Stop remained at 0 of 8 jobs and 0 processes |
+| System Extension | `com.byteplus.sealsuite.networkextension` remained enabled and was reported as a successful runtime-stop warning, not silently treated as a clean uninstall |
+| Password fallback | With passwordless registration unavailable, the standard administrator prompt completed the same suite Stop and the final audit again reported 0 jobs and 0 processes |
+| UI convergence | Both authorization paths released the busy indicator; helper/status/XPC deadlines remain the backstop for a non-responsive external process |
 
 ## Live verification on 2026-08-23
 
